@@ -4,7 +4,7 @@
 [plugin]
 # 装好后默认关闭，确认群号填对了再打开
 enabled = false
-config_version = "1.0.0"
+config_version = "1.0.1"
 
 [target]
 # 目标群号列表（填群号，不是 session_id）
@@ -17,6 +17,11 @@ active_hours = [9, 23]
 catch_up_minutes = 30
 # 聊天记录里视频上方是否带标题与数据说明
 include_header_text = true
+# 投递路线：forward=聊天记录内嵌视频（默认）/ video=直接发视频 / file=按文件发。
+# 嵌套视频段依赖宿主内部实现，宿主更新后若坏掉，改这一行就能换一条路。
+delivery_mode = "forward"
+# 三条路全失败时是否往群里说一句（避免安静地什么都不发）
+notify_on_failure = true
 
 [source]
 # 关键词池：屎不挑分区，靠这组词捞候选，再由艾特率筛
@@ -51,10 +56,20 @@ keep_files = 2
 title_blacklist = ["原神", "崩坏", "星穹铁道", "剧透", "直播回放", "录播", "合集"]
 tag_blacklist = []
 up_blacklist = []
+# 分区屏蔽名单（typename），命中即跳过；默认空，按需补
+typename_blacklist = []
+# 内容安全底线词：标题或标签命中即跳过（判据只看评论区，这里兜一层擦边/低俗内容）
+sensitive_words = ["擦边", "软色情", "性感", "福利姬", "成人向", "露点", "未成年"]
 
 [tool]
 # 是否允许群友用自然语言叫它搬史（LLM 工具 repost_shi）
 enabled = true
+# 谁能触发：anyone=群成员都可以 / whitelist=只有 whitelist 里的 QQ 能触发
+# 工具回调拿不到发言者 QQ，白名单是借入站钩子按会话回查的（同一群多人抢话时宁可拒绝）
+permission = "anyone"
+whitelist = []
+# 发言者缓存有效期（秒），超时后白名单模式会拒绝
+speaker_cache_ttl_seconds = 600
 # 同一个群两次点播的最小间隔（分钟）
 cooldown_minutes = 10
 # 每个群每天点播的次数上限（0 表示不限）

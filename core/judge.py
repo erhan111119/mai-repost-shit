@@ -82,7 +82,18 @@ class Judge:
             return "付费/合作视频"
         if parse_duration(str(item.get("duration") or "")) > self._cfg.max_duration_seconds:
             return "时长超上限"
+        typename = str(item.get("typename") or item.get("tname") or "")
+        hit = _hit_blacklist(typename, self._cfg.typename_blacklist)
+        if hit:
+            return f"分区命中屏蔽名单「{hit}」"
         title = str(item.get("title") or "")
+        # 内容安全底线：擦边/低俗类词命中即跳过（判据只看评论区，不含内容审核）
+        hit = _hit_blacklist(title, self._cfg.sensitive_words)
+        if hit:
+            return f"标题命中内容安全词「{hit}」"
+        hit = _hit_blacklist(str(item.get("tag") or ""), self._cfg.sensitive_words)
+        if hit:
+            return f"标签命中内容安全词「{hit}」"
         hit = _hit_blacklist(title, self._cfg.title_blacklist)
         if hit:
             return f"标题命中屏蔽词「{hit}」"

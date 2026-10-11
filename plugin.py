@@ -16,16 +16,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .core.bili_api import BiliClient
-from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS
+from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS, DEFAULT_SENSITIVE, DEFAULT_TYPENAME_BLACKLIST
 from .core.judge import Judge
 from .core.pipeline import Pipeline
+from .core.speaker import SpeakerCache, normalize_qq
 from .core.state import StateStore
 
 TOOL_REPOST = "repost_shi"
+# 入站钩子：群聊里 Tool 回调拿不到发言者 QQ，只能在这里按会话缓存真实发言者
+RECEIVE_HOOK = "chat.receive.after_process"
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -36,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.0.1", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -51,6 +54,12 @@ class TargetSectionConfig(PluginConfigBase):
     active_hours: List[int] = Field(default_factory=lambda: [9, 23], description="允许发送的时间范围 [起, 止]（24 小时制）")
     catch_up_minutes: int = Field(default=30, description="错过计划时刻后多久内仍补发，超时则跳过")
     include_header_text: bool = Field(default=True, description="聊天记录里视频上方是否带标题/数据说明")
+    delivery_mode: str = Field(
+        default="forward",
+        description="投递路线：forward=聊天记录内嵌视频（默认）/ video=直接发视频 / file=按文件发。"
+        "嵌套视频段依赖宿主内部实现，宿主更新后若坏掉就换一条路",
+    )
+    notify_on_failure: bool = Field(default=True, description="三条投递路线全失败时，是否往群里说一句（避免安静失败）")
 
 
 class SourceSectionConfig(PluginConfigBase):
@@ -102,7 +111,7 @@ class DownloadSectionConfig(PluginConfigBase):
 
 
 class FilterSectionConfig(PluginConfigBase):
-    """屏蔽词。"""
+    """屏蔽词与内容安全。"""
 
     __ui_label__ = "屏蔽"
     __ui_icon__ = "ban"
@@ -111,6 +120,13 @@ class FilterSectionConfig(PluginConfigBase):
     title_blacklist: List[str] = Field(default_factory=lambda: list(DEFAULT_BLACKLIST), description="标题屏蔽词")
     tag_blacklist: List[str] = Field(default_factory=list, description="标签屏蔽词")
     up_blacklist: List[str] = Field(default_factory=list, description="UP 主屏蔽词")
+    typename_blacklist: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_TYPENAME_BLACKLIST), description="分区屏蔽名单（命中即跳过）"
+    )
+    sensitive_words: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_SENSITIVE),
+        description="内容安全底线词：标题或标签命中即跳过（判据只看评论区，这里兜一层擦边/低俗内容）",
+    )
 
 
 class ToolSectionConfig(PluginConfigBase):
@@ -120,7 +136,14 @@ class ToolSectionConfig(PluginConfigBase):
     __ui_icon__ = "message-square"
     __ui_order__ = 6
 
-    enabled: bool = Field(default=True, description="是否允许群友用自然语言叫它搬史")
+    enabled: bool = Field(default=True, description="是否允许用自然语言叫它搬史")
+    permission: str = Field(
+        default="anyone",
+        description="谁能触发：anyone=群成员都可以 / whitelist=只有下白名单里的 QQ 能触发。"
+        "注意工具回调拿不到发言者 QQ，白名单是借助入站钩子按会话回查的",
+    )
+    whitelist: List[str] = Field(default_factory=list, description="permission=whitelist 时允许触发的 QQ 号列表")
+    speaker_cache_ttl_seconds: int = Field(default=600, description="发言者缓存有效期（秒），超时后白名单模式会拒绝")
     cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
     daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
     max_count: int = Field(default=3, description="单次点播最多搬几条")
@@ -163,6 +186,10 @@ class RunConfig:
     title_blacklist: List[str]
     tag_blacklist: List[str]
     up_blacklist: List[str]
+    typename_blacklist: List[str]
+    sensitive_words: List[str]
+    delivery_mode: str
+    notify_on_failure: bool
 
 
 class BilibiliShitpostPlugin(MaiBotPlugin):
@@ -180,6 +207,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._running = False
         # 点播任务在创建时同步置位，避免连续两次点播都通过重入检查
         self._manual_busy = False
+        # 群聊里工具回调拿不到发言者 QQ，靠入站钩子按会话缓存，供白名单校验
+        self._speakers: Optional[SpeakerCache] = None
 
     # ===== 生命周期 =====
 
@@ -193,6 +222,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._store = StateStore(data_dir / "state.json", self.ctx.logger)
         self._store.load()
         self._client = BiliClient(self.ctx.logger)
+        self._speakers = SpeakerCache(self.config.tool.speaker_cache_ttl_seconds, self.ctx.logger)
         self._pipeline = Pipeline(
             ctx=self.ctx,
             client=self._client,
@@ -202,10 +232,13 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             work_dir=work_dir,
         )
         self._loop_task = asyncio.create_task(self._schedule_loop(), name="mai-repost-shit-scheduler")
+        mode = self._permission_mode()
         self.ctx.logger.info(
             f"搬史机已装载：目标群 {self.config.target.groups or '（未配置）'}，"
             f"每天 {self.config.target.daily_times} 次，播放区间 "
-            f"{self.config.source.play_min}~{self.config.source.play_max}"
+            f"{self.config.source.play_min}~{self.config.source.play_max}，"
+            f"投递模式 {self.config.target.delivery_mode}，"
+            f"自然语言点播 {self._describe_permission(mode)}"
         )
 
     async def on_unload(self) -> None:
@@ -256,7 +289,69 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             title_blacklist=list(cfg.filters.title_blacklist),
             tag_blacklist=list(cfg.filters.tag_blacklist),
             up_blacklist=list(cfg.filters.up_blacklist),
+            typename_blacklist=list(cfg.filters.typename_blacklist),
+            sensitive_words=list(cfg.filters.sensitive_words),
+            delivery_mode=str(cfg.target.delivery_mode or "forward"),
+            notify_on_failure=cfg.target.notify_on_failure,
         )
+
+    # ===== 发言者缓存与点播权限 =====
+
+    @HookHandler(
+        RECEIVE_HOOK,
+        name="repost_shi_cache_speaker",
+        description="缓存各会话最近一位真人发言者，供自然语言点播做白名单校验",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,  # 缓存失败绝不影响入站处理
+    )
+    async def cache_speaker(self, message: Dict[str, Any] | None = None, **kwargs: Any) -> None:
+        """只读观察：记录发言者后原样放行（返回 None）。"""
+        del kwargs
+        try:
+            if self._speakers is None or not isinstance(message, dict):
+                return None
+            session_id = str(message.get("session_id") or "").strip()
+            user_info = (message.get("message_info") or {}).get("user_info") or {}
+            speaker = normalize_qq(user_info.get("user_id"))
+            if not session_id or not speaker:
+                return None  # 系统/通知类消息没有发言者，跳过
+            self._speakers.remember(
+                session_id,
+                speaker,
+                str(user_info.get("user_cardname") or user_info.get("user_nickname") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - 缓存失败不影响入站
+            self.ctx.logger.debug(f"缓存发言者失败（已忽略）: {exc!r}")
+        return None
+
+    def _permission_mode(self) -> str:
+        """规范化权限模式，未知值一律按最严格的 whitelist 处理。"""
+        mode = str(self.config.tool.permission or "anyone").strip().lower()
+        return mode if mode in {"anyone", "whitelist"} else "whitelist"
+
+    def _describe_permission(self, mode: str) -> str:
+        if mode == "anyone":
+            return "全员可触发（仅按群冷却限流）"
+        count = len([q for q in (normalize_qq(x) for x in self.config.tool.whitelist) if q])
+        return f"白名单（{count} 个 QQ）" if count else "白名单（名单为空，实际无人可触发）"
+
+    def _permission_denied_reason(self, stream_id: str) -> str:
+        """返回拒绝原因；允许则返回空串。"""
+        mode = self._permission_mode()
+        if mode == "anyone":
+            return ""
+        allowed = {q for q in (normalize_qq(x) for x in self.config.tool.whitelist) if q}
+        if not allowed:
+            self.ctx.logger.warning("点播权限设为 whitelist 但白名单为空，已拒绝本次触发")
+            return "这个功能当前只对白名单开放，但白名单还没配"
+        speaker = self._speakers.resolve(stream_id) if self._speakers is not None else None
+        if speaker is None:
+            # 工具回调拿不到发言者，只能靠入站钩子的缓存；拿不到就拒绝，不能放过
+            return "没认出你是谁（缓存里没有你的发言），先在群里说句话再叫我"
+        if speaker["user_id"] not in allowed:
+            return f"这个功能只对白名单开放（{speaker['user_id']} 不在名单里）"
+        return ""
 
     # ===== 定时循环 =====
 
@@ -373,6 +468,10 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             return self._tool_result("搬史功能没开（插件配置里 [plugin].enabled 还是 false）。")
         if not self.config.tool.enabled:
             return self._tool_result("自然语言点播被关掉了，要用的话让管理员开 [tool].enabled。")
+        # 权限：命令是 operator 专属，工具默认全员可用但可收紧成白名单
+        denied = self._permission_denied_reason(stream_id)
+        if denied:
+            return self._tool_result(f"先不搬：{denied}。管理员可以用 /搬史 指令搬。")
         if self._store is None:
             return self._tool_result("插件还没就绪，稍后再试。")
         if self._manual_busy or self._running:
@@ -380,8 +479,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
 
         limit = max(1, self.config.tool.max_count)
         wanted = max(1, min(int(count or 1), limit))
-        # 手动触发不占定时配额，但有独立的冷却与每日上限：
-        # 这里拿不到点播者的真实 user_id（群聊工具里该字段恒为空），所以只能按会话限流
+        # 手动触发不占定时配额，但有独立的冷却与每日上限（按会话记账）
         block = self._store.manual_block_reason(
             stream_id,
             cooldown_minutes=self.config.tool.cooldown_minutes,
@@ -501,8 +599,10 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"判据：艾特率 ≥ {self.config.judge.at_ratio_threshold:.0%}"
             f" 且评论 ≥ {self.config.judge.min_comments} 条",
             f"目标群 {self.config.target.groups or '（未配置）'}",
+            f"投递模式 {self.config.target.delivery_mode}（失败会依次回退，全部失败会报出来）",
             f"自然语言点播：{'开' if self.config.tool.enabled else '关'}"
-            f"（冷却 {self.config.tool.cooldown_minutes} 分钟，每群每天 "
+            f"（{self._describe_permission(self._permission_mode())}，"
+            f"冷却 {self.config.tool.cooldown_minutes} 分钟，每群每天 "
             f"{self.config.tool.daily_limit_per_group} 次）",
         ]
         if recent:
