@@ -203,6 +203,7 @@ class BiliClient:
         play_min: int,
         play_max: int,
         video_review_min: int,
+        video_review_max: int = 0,
     ) -> List[Dict[str, Any]]:
         """按关键词 + 时间窗搜索，返回落在播放量区间内的候选。"""
         await self.warmup()
@@ -224,8 +225,12 @@ class BiliClient:
         for item in (data.get("data") or {}).get("result") or []:
             play = int(item.get("play") or 0)
             review = int(item.get("video_review") or 0)
-            if play_min <= play <= play_max and review >= video_review_min:
-                out.append(item)
+            if not (play_min <= play <= play_max and review >= video_review_min):
+                continue
+            # 评论数上限：评论特别多的多是解说/剧集/大热门，实测艾特率反而低
+            if video_review_max and review > video_review_max:
+                continue
+            out.append(item)
         return out
 
     async def video_detail(self, bvid: str) -> Dict[str, Any]:

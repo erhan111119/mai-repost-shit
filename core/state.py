@@ -13,7 +13,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-_CHECKED_KEEP_DAYS = 60
+# 被否掉的候选只记 14 天：搜索会把同一批视频反复捞出来，记太久会让可检查候选枯竭
+# （已搬过的另用 _sent 永久记住，不会重复搬）
+_CHECKED_KEEP_DAYS = 14
 _SENT_KEEP = 500
 _MANUAL_KEEP_DAYS = 7
 

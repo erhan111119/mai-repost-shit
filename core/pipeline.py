@@ -72,6 +72,7 @@ class Pipeline:
                     play_min=cfg.play_min,
                     play_max=cfg.play_max,
                     video_review_min=cfg.min_video_review,
+                    video_review_max=int(getattr(cfg, "max_video_review", 0) or 0),
                 )
             except BiliError as exc:
                 self._logger.warning(f"搜索「{keyword}」失败: {exc}")
@@ -100,8 +101,10 @@ class Pipeline:
                 continue
             fresh.append(item)
         self._logger.info(f"本轮候选 {len(raw)} 条，可检查 {len(fresh)} 条")
-        # 评论数多的优先：分母足够，艾特率才可信；但封顶 300，避免长合集靠评论数霸榜
-        fresh.sort(key=lambda item: min(int(item.get("video_review") or 0), 300), reverse=True)
+        # 随机排序，不要按评论数降序：实测评论数越多艾特率越低
+        # （今天的分档采样：40~150 条评论中位 33%、600+ 只 10%），
+        # 按降序挑等于每轮专挑最差的一批先看。
+        random.shuffle(fresh)
         checked = 0
         for item in fresh:
             if checked >= cfg.max_check_per_run:

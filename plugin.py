@@ -42,7 +42,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.7", description="配置版本")
+    config_version: str = Field(default="1.0.8", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -67,16 +67,22 @@ class SourceSectionConfig(PluginConfigBase):
     __ui_order__ = 2
 
     keywords: List[str] = Field(default_factory=lambda: list(DEFAULT_KEYWORDS), description="关键词池，每轮随机抽几个")
-    keywords_per_run: int = Field(default=6, description="每轮用几个关键词搜")
+    keywords_per_run: int = Field(default=8, description="每轮用几个关键词搜")
     orders: List[str] = Field(default_factory=lambda: ["totalrank", "pubdate"], description="搜索排序方式")
     page_max: int = Field(default=3, description="每个关键词随机翻到第几页（上限）")
     window_hours: List[int] = Field(default_factory=lambda: [72, 720], description="发布时间窗 [最近, 最远]（小时）")
     play_min: int = Field(default=50000, description="播放量下限")
     play_max: int = Field(default=300000, description="播放量上限")
     min_video_review: int = Field(default=40, description="评论数下限（搜索接口自带，用来保证艾特率有分母）")
+    max_video_review: int = Field(
+        default=600,
+        description="评论数上限（0 表示不限）。实测评论越多艾特率越低（40~150 条中位 33%、600+ 只 10%），"
+        "所以把解说/剧集类大热门筛掉",
+    )
     max_check_per_run: int = Field(
-        default=12,
-        description="每轮最多实际检查几条候选（每条约 4 个请求；实测约 20% 能过 50% 艾特率）",
+        default=16,
+        description="每轮最多实际检查几条候选（每条约 4 个请求）。"
+        "实测能过 50% 艾特率的候选约占一成，检查越多越容易出片",
     )
 
 
@@ -182,6 +188,7 @@ class RunConfig:
     play_min: int
     play_max: int
     min_video_review: int
+    max_video_review: int
     max_check_per_run: int
     at_ratio_threshold: float
     min_comments: int
@@ -321,6 +328,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             play_min=cfg.source.play_min,
             play_max=cfg.source.play_max,
             min_video_review=cfg.source.min_video_review,
+            max_video_review=cfg.source.max_video_review,
             max_check_per_run=cfg.source.max_check_per_run,
             at_ratio_threshold=cfg.judge.at_ratio_threshold,
             min_comments=cfg.judge.min_comments,
