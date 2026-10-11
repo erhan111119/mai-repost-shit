@@ -1,0 +1,524 @@
+"""mai repost shit —— 定时把「评论区全是艾特」的B站视频压成 720p 以聊天记录搬进群。
+
+设计要点（都是实测结论，改之前先读 docs/NOTES.md）：
+  * 判据只有一条：评论含 @ 比例 ≥ 阈值，且评论样本数达标（否则比值是噪声）。
+  * 只搬一条/轮：一天两三次，靠 StateStore 生成随机时刻，重启不会补发一堆。
+  * 不转码：免登录 playurl 最高就是 720P，直接按档位下载即可，本机也不需要 ffmpeg。
+  * 投递用合并转发 + 本地文件路径引用（base64 会撞 RPC 16MB 帧上限）。
+  * 除了命令，还注册了一个 Tool 让群友用自然语言点播（「搬个史」「来点鬼畜的」）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+from .core.bili_api import BiliClient
+from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS
+from .core.judge import Judge
+from .core.pipeline import Pipeline
+from .core.state import StateStore
+
+TOOL_REPOST = "repost_shi"
+
+
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础配置。"""
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
+    config_version: str = Field(default="1.0.0", description="配置版本")
+
+
+class TargetSectionConfig(PluginConfigBase):
+    """投递目标与频率。"""
+
+    __ui_label__ = "投递"
+    __ui_icon__ = "send"
+    __ui_order__ = 1
+
+    groups: List[str] = Field(default_factory=list, description="目标群号列表（填群号，不是流 ID）")
+    daily_times: int = Field(default=3, description="每天搬几次")
+    active_hours: List[int] = Field(default_factory=lambda: [9, 23], description="允许发送的时间范围 [起, 止]（24 小时制）")
+    catch_up_minutes: int = Field(default=30, description="错过计划时刻后多久内仍补发，超时则跳过")
+    include_header_text: bool = Field(default=True, description="聊天记录里视频上方是否带标题/数据说明")
+
+
+class SourceSectionConfig(PluginConfigBase):
+    """候选检索。"""
+
+    __ui_label__ = "检索"
+    __ui_icon__ = "search"
+    __ui_order__ = 2
+
+    keywords: List[str] = Field(default_factory=lambda: list(DEFAULT_KEYWORDS), description="关键词池，每轮随机抽几个")
+    keywords_per_run: int = Field(default=6, description="每轮用几个关键词搜")
+    orders: List[str] = Field(default_factory=lambda: ["totalrank", "pubdate"], description="搜索排序方式")
+    page_max: int = Field(default=3, description="每个关键词随机翻到第几页（上限）")
+    window_hours: List[int] = Field(default_factory=lambda: [72, 720], description="发布时间窗 [最近, 最远]（小时）")
+    play_min: int = Field(default=50000, description="播放量下限")
+    play_max: int = Field(default=300000, description="播放量上限")
+    min_video_review: int = Field(default=40, description="评论数下限（搜索接口自带，用来保证艾特率有分母）")
+    max_check_per_run: int = Field(
+        default=12,
+        description="每轮最多实际检查几条候选（每条约 4 个请求；实测约 20% 能过 50% 艾特率）",
+    )
+
+
+class JudgeSectionConfig(PluginConfigBase):
+    """艾特率判据。"""
+
+    __ui_label__ = "判据"
+    __ui_icon__ = "filter"
+    __ui_order__ = 3
+
+    at_ratio_threshold: float = Field(default=0.5, description="评论含 @ 比例阈值")
+    min_comments: int = Field(default=30, description="评论样本下限，不足则判样本不足")
+    comment_pages: int = Field(default=3, description="取几页评论（每页 20 条）")
+
+
+class DownloadSectionConfig(PluginConfigBase):
+    """下载与体积控制。"""
+
+    __ui_label__ = "下载"
+    __ui_icon__ = "download"
+    __ui_order__ = 4
+
+    max_duration_seconds: int = Field(default=240, description="视频时长上限（秒）")
+    max_size_mb: int = Field(default=40, description="下载体积上限（MB）")
+    quality_preference: List[int] = Field(
+        default_factory=lambda: [64, 32, 16], description="清晰度优先级（64=720P, 32=480P, 16=360P）"
+    )
+    keep_files: int = Field(default=2, description="本地保留最近几个视频文件")
+
+
+class FilterSectionConfig(PluginConfigBase):
+    """屏蔽词。"""
+
+    __ui_label__ = "屏蔽"
+    __ui_icon__ = "ban"
+    __ui_order__ = 5
+
+    title_blacklist: List[str] = Field(default_factory=lambda: list(DEFAULT_BLACKLIST), description="标题屏蔽词")
+    tag_blacklist: List[str] = Field(default_factory=list, description="标签屏蔽词")
+    up_blacklist: List[str] = Field(default_factory=list, description="UP 主屏蔽词")
+
+
+class ToolSectionConfig(PluginConfigBase):
+    """自然语言点播（LLM Tool）。"""
+
+    __ui_label__ = "自然语言"
+    __ui_icon__ = "message-square"
+    __ui_order__ = 6
+
+    enabled: bool = Field(default=True, description="是否允许群友用自然语言叫它搬史")
+    cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
+    daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
+    max_count: int = Field(default=3, description="单次点播最多搬几条")
+
+
+class ShitpostConfig(PluginConfigBase):
+    """插件配置。"""
+
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    target: TargetSectionConfig = Field(default_factory=TargetSectionConfig)
+    source: SourceSectionConfig = Field(default_factory=SourceSectionConfig)
+    judge: JudgeSectionConfig = Field(default_factory=JudgeSectionConfig)
+    download: DownloadSectionConfig = Field(default_factory=DownloadSectionConfig)
+    filters: FilterSectionConfig = Field(default_factory=FilterSectionConfig)
+    tool: ToolSectionConfig = Field(default_factory=ToolSectionConfig)
+
+
+@dataclass
+class RunConfig:
+    """一次搬运所需的扁平配置，供 core 层的模块使用。"""
+
+    groups: List[str]
+    include_header_text: bool
+    keywords: List[str]
+    keywords_per_run: int
+    orders: List[str]
+    page_max: int
+    window_hours: List[int]
+    play_min: int
+    play_max: int
+    min_video_review: int
+    max_check_per_run: int
+    at_ratio_threshold: float
+    min_comments: int
+    comment_pages: int
+    max_duration_seconds: int
+    max_size_mb: int
+    quality_preference: List[int]
+    keep_files: int
+    title_blacklist: List[str]
+    tag_blacklist: List[str]
+    up_blacklist: List[str]
+
+
+class BilibiliShitpostPlugin(MaiBotPlugin):
+    """定时搬运B站「艾特率超标」视频的插件。"""
+
+    config_model = ShitpostConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._client: Optional[BiliClient] = None
+        self._store: Optional[StateStore] = None
+        self._pipeline: Optional[Pipeline] = None
+        self._loop_task: Optional[asyncio.Task[None]] = None
+        self._wake = asyncio.Event()
+        self._running = False
+        # 点播任务在创建时同步置位，避免连续两次点播都通过重入检查
+        self._manual_busy = False
+
+    # ===== 生命周期 =====
+
+    async def on_load(self) -> None:
+        """装载状态、建客户端、起定时循环。"""
+        data_dir = self.ctx.paths.data_dir
+        work_dir = self.ctx.paths.runtime_dir / "clips"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        self._store = StateStore(data_dir / "state.json", self.ctx.logger)
+        self._store.load()
+        self._client = BiliClient(self.ctx.logger)
+        self._pipeline = Pipeline(
+            ctx=self.ctx,
+            client=self._client,
+            judge=Judge(self._client, self._run_config(), self.ctx.logger),
+            store=self._store,
+            logger=self.ctx.logger,
+            work_dir=work_dir,
+        )
+        self._loop_task = asyncio.create_task(self._schedule_loop(), name="mai-repost-shit-scheduler")
+        self.ctx.logger.info(
+            f"搬史机已装载：目标群 {self.config.target.groups or '（未配置）'}，"
+            f"每天 {self.config.target.daily_times} 次，播放区间 "
+            f"{self.config.source.play_min}~{self.config.source.play_max}"
+        )
+
+    async def on_unload(self) -> None:
+        """停循环、落盘、关连接。宿主只给 5 秒，全部操作都要快。"""
+        if self._loop_task and not self._loop_task.done():
+            self._loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._loop_task
+        self._loop_task = None
+        if self._store is not None:
+            await self._store.save()
+        if self._client is not None:
+            await self._client.aclose()
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        """配置热重载：判据的阈值要跟着换。"""
+        self.ctx.logger.info(f"配置已更新（scope={scope} version={version}），下一轮生效")
+        if self._client is not None and self._pipeline is not None:
+            self._pipeline.set_judge(Judge(self._client, self._run_config(), self.ctx.logger))
+
+    # ===== 配置快照 =====
+
+    def _run_config(self) -> RunConfig:
+        """把分层配置拍平成 core 层要的一次性配置。"""
+        cfg = self.config
+        window = list(cfg.source.window_hours)
+        while len(window) < 2:
+            window.append(720)
+        return RunConfig(
+            groups=[str(g).strip() for g in cfg.target.groups if str(g).strip()],
+            include_header_text=cfg.target.include_header_text,
+            keywords=list(cfg.source.keywords),
+            keywords_per_run=cfg.source.keywords_per_run,
+            orders=list(cfg.source.orders),
+            page_max=cfg.source.page_max,
+            window_hours=window[:2],
+            play_min=cfg.source.play_min,
+            play_max=cfg.source.play_max,
+            min_video_review=cfg.source.min_video_review,
+            max_check_per_run=cfg.source.max_check_per_run,
+            at_ratio_threshold=cfg.judge.at_ratio_threshold,
+            min_comments=cfg.judge.min_comments,
+            comment_pages=cfg.judge.comment_pages,
+            max_duration_seconds=cfg.download.max_duration_seconds,
+            max_size_mb=cfg.download.max_size_mb,
+            quality_preference=list(cfg.download.quality_preference),
+            keep_files=cfg.download.keep_files,
+            title_blacklist=list(cfg.filters.title_blacklist),
+            tag_blacklist=list(cfg.filters.tag_blacklist),
+            up_blacklist=list(cfg.filters.up_blacklist),
+        )
+
+    # ===== 定时循环 =====
+
+    async def _schedule_loop(self) -> None:
+        """每分钟醒一次看是否到点；被 cancel 时立刻退出，配合宿主 5 秒卸载预算。"""
+        while True:
+            try:
+                self._wake.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=60)
+            except asyncio.CancelledError:
+                break
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.error(f"定时搬运异常: {exc!r}", exc_info=True)
+
+    async def _tick(self) -> None:
+        """到点就跑一轮。"""
+        if self._pipeline is None or self._store is None:
+            return
+        cfg = self.config
+        if not cfg.plugin.enabled:
+            return
+        now = datetime.now()
+        store = self._store
+        store.ensure_plan(
+            now,
+            times_per_day=cfg.target.daily_times,
+            hour_start=int(cfg.target.active_hours[0]),
+            hour_end=int(cfg.target.active_hours[1]),
+        )
+        due = store.next_due(now)
+        if due is None:
+            await store.save()
+            return
+        if now.timestamp() < due:
+            await store.save()
+            return
+        # 过期太久（比如插件刚被重启）就跳过，避免开服瞬间补发三条
+        if now.timestamp() - due > max(1, cfg.target.catch_up_minutes) * 60:
+            store.mark_plan_done(due)
+            await store.save()
+            self.ctx.logger.info("错过的发送时刻已跳过（超出补发窗口）")
+            return
+        store.mark_plan_done(due)
+        await store.save()
+        await self._run_and_report(self._run_config())
+
+    async def _run_and_report(
+        self,
+        cfg: RunConfig,
+        override_stream: str = "",
+        extra_keywords: Sequence[str] = (),
+    ) -> Dict[str, Any]:
+        """跑一轮并汇报结果，带重入保护。"""
+        if self._pipeline is None:
+            return {"sent": False, "reason": "插件尚未就绪"}
+        if self._running:
+            return {"sent": False, "reason": "上一轮还在进行中"}
+        self._running = True
+        try:
+            report = await self._pipeline.run_once(
+                cfg, override_stream=override_stream, extra_keywords=extra_keywords
+            )
+        finally:
+            self._running = False
+        if self._store is not None:
+            await self._store.save()
+        if report.get("sent"):
+            candidate = report.get("candidate") or {}
+            self.ctx.logger.info(f"本轮已搬：{candidate.get('title')}")
+        else:
+            self.ctx.logger.info(f"本轮未搬：{report.get('reason')}")
+        return report
+
+    # ===== 自然语言点播（LLM Tool）=====
+
+    @Tool(
+        TOOL_REPOST,
+        brief_description=(
+            "从B站搬一条「史」到当前群：专挑评论区艾特率超过 50% 的抽象视频，"
+            "下载成 720p 后以聊天记录的形式发出来。"
+            "当有人想搬史、要来点抽象的、想看乐子、点名要某类整活/鬼畜视频时调用。"
+            "调用后立刻返回，视频在后台下载并自动发出——不要再追问「要不要」「确定吗」，"
+            "也不要先回一句「我这就去找」；简单应一声「搬着呢」即可。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="topic",
+                param_type=ToolParamType.STRING,
+                description="对方点名的口味或主题，例如「鬼畜」「抽象」「答辩」「游戏」；没点名就留空",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="count",
+                param_type=ToolParamType.INTEGER,
+                description="要几条，默认 1；对方说「来几个」「多来点」时给 2 或 3",
+                required=False,
+                default=1,
+            ),
+        ],
+        visibility="visible",
+        chat_scope="all",
+    )
+    async def tool_repost(self, topic: str = "", count: int = 1, **kwargs: Any) -> Dict[str, Any]:
+        """群友用自然语言点播一条（或几条）史。"""
+        stream_id = str(kwargs.get("stream_id") or "")
+        if not stream_id:
+            return self._tool_result("拿不到当前会话，没法搬。")
+        if not self.config.plugin.enabled:
+            return self._tool_result("搬史功能没开（插件配置里 [plugin].enabled 还是 false）。")
+        if not self.config.tool.enabled:
+            return self._tool_result("自然语言点播被关掉了，要用的话让管理员开 [tool].enabled。")
+        if self._store is None:
+            return self._tool_result("插件还没就绪，稍后再试。")
+        if self._manual_busy or self._running:
+            return self._tool_result("正在搬上一条，等它发出来再说。")
+
+        limit = max(1, self.config.tool.max_count)
+        wanted = max(1, min(int(count or 1), limit))
+        # 手动触发不占定时配额，但有独立的冷却与每日上限：
+        # 这里拿不到点播者的真实 user_id（群聊工具里该字段恒为空），所以只能按会话限流
+        block = self._store.manual_block_reason(
+            stream_id,
+            cooldown_minutes=self.config.tool.cooldown_minutes,
+            daily_limit=self.config.tool.daily_limit_per_group,
+        )
+        if block:
+            return self._tool_result(f"先不搬：{block}。")
+
+        self._store.record_manual(stream_id)
+        await self._store.save()
+        extra = [topic.strip()] if topic and topic.strip() else []
+        self._manual_busy = True
+        task = asyncio.create_task(self._manual_share(stream_id, wanted, extra), name="mai-repost-shit-manual")
+        task.add_done_callback(self._on_manual_done)
+        taste = f"（挑 {topic.strip()} 那类的）" if extra else ""
+        return self._tool_result(
+            f"已经去B站找了{taste}，找到会直接发到这个群，大概要一两分钟。"
+            + (f"这次要搬 {wanted} 条。" if wanted > 1 else "")
+        )
+
+    async def _manual_share(self, stream_id: str, wanted: int, extra_keywords: List[str]) -> None:
+        """后台跑完手动点播：每条都是完整的检索→判据→下载→投递。"""
+        try:
+            cfg = self._run_config()
+            for index in range(wanted):
+                report = await self._run_and_report(cfg, override_stream=stream_id, extra_keywords=extra_keywords)
+                if report.get("sent"):
+                    continue
+                reason = str(report.get("reason") or "没找到合适的")
+                # 第一条就没搬成才回话；后续条数失败保持安静，避免刷屏
+                if index == 0:
+                    with contextlib.suppress(Exception):
+                        await self.ctx.send.text(f"这次没搬成：{reason}", stream_id)
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error(f"点播搬运异常: {exc!r}", exc_info=True)
+
+    def _on_manual_done(self, task: asyncio.Task[None]) -> None:
+        """收尾：清忙标志，并把异常取出来记日志（否则会被静默吞掉）。"""
+        self._manual_busy = False
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.ctx.logger.error(f"点播任务失败: {exc!r}")
+
+    @staticmethod
+    def _tool_result(content: str) -> Dict[str, Any]:
+        """构造 Tool 返回值（内容会进入模型上下文）。"""
+        return {"name": TOOL_REPOST, "content": content}
+
+    # ===== 命令 =====
+
+    @Command(
+        "shitpost_now",
+        description="立刻按配置搬一条史到指定群（需管理员）",
+        pattern=r"^/搬史$",
+        permission="operator",
+    )
+    async def cmd_share_now(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
+        """手动触发一次搬运（仍走配置里的目标群）。"""
+        del kwargs
+        if not self.config.plugin.enabled:
+            return False, "插件未启用，请先在配置里打开", 0
+        if not self.config.target.groups:
+            return False, "还没有配置目标群号", 0
+        cfg = self._run_config()
+        report = await self._run_and_report(cfg)
+        if report.get("sent"):
+            candidate = report.get("candidate") or {}
+            return True, f"已搬：{candidate.get('title')}", 1
+        return False, f"没搬成：{report.get('reason')}", 0
+
+    @Command(
+        "shitpost_here",
+        description="立刻搬一条史发到当前会话，用来试效果（需管理员）",
+        pattern=r"^/搬史测试$",
+        permission="operator",
+    )
+    async def cmd_share_here(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
+        """把一条视频发到当前会话，便于在不打扰群的情况下验证投递链路。"""
+        del kwargs
+        if not stream_id:
+            return False, "拿不到当前会话 ID", 0
+        cfg = self._run_config()
+        report = await self._run_and_report(cfg, override_stream=stream_id)
+        if report.get("sent"):
+            candidate = report.get("candidate") or {}
+            return True, f"已发到本会话：{candidate.get('title')}", 1
+        return False, f"没成功：{report.get('reason')}", 0
+
+    @Command(
+        "shitpost_status",
+        description="查看今日搬运计划与最近记录",
+        pattern=r"^/搬史状态$",
+    )
+    async def cmd_status(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
+        """回报计划、配额与最近搬过什么。"""
+        del kwargs
+        if self._store is None:
+            return False, "插件尚未就绪", 0
+        now = datetime.now()
+        self._store.ensure_plan(
+            now,
+            times_per_day=self.config.target.daily_times,
+            hour_start=int(self.config.target.active_hours[0]),
+            hour_end=int(self.config.target.active_hours[1]),
+        )
+        plan = self._store.plan_summary(now)
+        recent = self._store.recent_sent(5)
+        lines = [
+            f"今日计划 {plan['done']}/{plan['total']} 次，时刻 {', '.join(plan['times']) or '无'}",
+            f"时间窗 {self.config.source.window_hours} 小时，播放 "
+            f"{self.config.source.play_min}~{self.config.source.play_max}",
+            f"判据：艾特率 ≥ {self.config.judge.at_ratio_threshold:.0%}"
+            f" 且评论 ≥ {self.config.judge.min_comments} 条",
+            f"目标群 {self.config.target.groups or '（未配置）'}",
+            f"自然语言点播：{'开' if self.config.tool.enabled else '关'}"
+            f"（冷却 {self.config.tool.cooldown_minutes} 分钟，每群每天 "
+            f"{self.config.tool.daily_limit_per_group} 次）",
+        ]
+        if recent:
+            lines.append("最近搬过：")
+            for record in reversed(recent):
+                when = datetime.fromtimestamp(record.get("sent_at", 0)).strftime("%m-%d %H:%M")
+                lines.append(
+                    f"· {when} {str(record.get('title') or '')[:24]}"
+                    f"（艾特率 {float(record.get('at_ratio') or 0):.0%}）"
+                )
+        text = "\n".join(lines)
+        if stream_id:
+            await self.ctx.send.text(text, stream_id)
+        return True, text, 1
+
+
+def create_plugin() -> BilibiliShitpostPlugin:
+    """插件工厂。"""
+    return BilibiliShitpostPlugin()
