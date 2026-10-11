@@ -214,19 +214,24 @@ class Pipeline:
             targets = [(group_id, group_id) for group_id in cfg.groups]
 
         for stream_id, label in targets:
+            target_label = label
             if not override_stream:
-                stream_id = await self._resolve_stream(stream_id) or ""
-                if not stream_id:
-                    self._logger.warning(f"找不到群 {label} 的聊天流，跳过")
+                resolved = await self._resolve_stream(stream_id)
+                if resolved is None:
+                    self._logger.warning(
+                        f"目标 {label} 解析不到聊天流，跳过（群号写错了？该群/该人还没产生过消息？）"
+                    )
                     report["targets"].append({"group": label, "sent": False, "reason": "no_stream"})
                     continue
+                stream_id, kind = resolved
+                target_label = f"{label}（{kind}）"
             result = await self._deliverer.send(stream_id, candidate, video_path, cfg)
             sent = bool(result.get("sent") or result.get("method") == "forward")
-            report["targets"].append({"group": label, "sent": sent, "method": result.get("method")})
+            report["targets"].append({"group": target_label, "sent": sent, "method": result.get("method")})
             if sent:
                 await append_context(self._ctx, stream_id, candidate, self._logger)
             else:
-                self._logger.error(f"{label} 投递失败: {result}")
+                self._logger.error(f"{target_label} 投递失败: {result}")
 
         if any(item.get("sent") for item in report["targets"]):
             report["sent"] = True
@@ -248,15 +253,31 @@ class Pipeline:
         report["candidate"] = self._candidate_brief(candidate)
         return report
 
-    async def _resolve_stream(self, group_id: str) -> Optional[str]:
-        """把群号解析成真实聊天流 ID。"""
-        try:
-            stream = await self._ctx.chat.get_stream_by_group_id(str(group_id), platform="qq")
-        except Exception as exc:  # noqa: BLE001
-            self._logger.warning(f"查询群 {group_id} 的聊天流异常: {exc!r}")
-            return None
-        if isinstance(stream, dict):
-            return str(stream.get("session_id") or stream.get("stream_id") or "") or None
+    async def resolve_target(self, target: str) -> Optional[Tuple[str, str]]:
+        """公开的解析入口（装载自检也会用）。"""
+        return await self._resolve_stream(target)
+
+    async def _resolve_stream(self, target: str) -> Optional[Tuple[str, str]]:
+        """把配置里的目标解析成真实聊天流。
+
+        先当群号找，找不到再当 QQ 号找私聊——配置里填一个 QQ 号是很自然的事
+        （实测用户就把主人的 QQ 填进了 groups 以为是发给他），
+        只支持群号会导致定时任务静默空转。
+        """
+        lookups = (
+            ("群", self._ctx.chat.get_stream_by_group_id),
+            ("私聊", self._ctx.chat.get_stream_by_user_id),
+        )
+        for kind, getter in lookups:
+            try:
+                stream = await getter(str(target), platform="qq")
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning(f"解析目标 {target}（按{kind}）异常: {exc!r}")
+                continue
+            if isinstance(stream, dict):
+                session_id = str(stream.get("session_id") or stream.get("stream_id") or "")
+                if session_id:
+                    return session_id, kind
         return None
 
     def _cleanup_old_videos(self, keep: int) -> None:

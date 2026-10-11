@@ -39,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.5", description="配置版本")
+    config_version: str = Field(default="1.0.6", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -247,6 +247,32 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
                 "自然语言点播当前为「全员可触发」：群里任何人说一句就能让它检索并往群里发视频。"
                 '要收紧就把 [tool].permission 设为 "whitelist" 并填 [tool].whitelist，'
                 "或把 [tool].enabled 设为 false 只留管理员命令 /搬史。"
+            )
+        if self.config.plugin.enabled:
+            await self._check_targets()
+
+    async def _check_targets(self) -> None:
+        """装载时把目标解析一遍：解析不到就当场告警，别等定时轮到点才静默跳过。
+
+        注意：聊天流要等该群/该人产生过消息才存在，所以这里只能告警、不能禁用功能。
+        """
+        if self._pipeline is None:
+            return
+        resolved: List[str] = []
+        failed: List[str] = []
+        for target in self._run_config().groups:
+            result = await self._pipeline.resolve_target(target)
+            if result is None:
+                failed.append(target)
+            else:
+                resolved.append(f"{target}（{result[1]}）")
+        if resolved:
+            self.ctx.logger.info(f"目标解析成功：{'、'.join(resolved)}")
+        if failed:
+            self.ctx.logger.warning(
+                f"目标解析不到聊天流：{'、'.join(failed)}"
+                "——定时搬运到这些目标时会跳过。群号写错了？或者该群/该人还没产生过消息？"
+                "（目标既可以是群号，也可以是 QQ 号发私聊）"
             )
 
     async def on_unload(self) -> None:
