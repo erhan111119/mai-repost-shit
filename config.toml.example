@@ -4,7 +4,7 @@
 [plugin]
 # 装好后默认关闭，确认群号填对了再打开
 enabled = false
-config_version = "1.0.1"
+config_version = "1.0.2"
 
 [target]
 # 目标群号列表（填群号，不是 session_id）
@@ -56,8 +56,9 @@ keep_files = 2
 title_blacklist = ["原神", "崩坏", "星穹铁道", "剧透", "直播回放", "录播", "合集"]
 tag_blacklist = []
 up_blacklist = []
-# 分区屏蔽名单（typename），命中即跳过；默认空，按需补
-typename_blacklist = []
+# 分区屏蔽名单（typename），子串匹配，命中即跳过
+# 默认避开「片名/IP 类」分区：影视剧、番剧、纪录片、直播等既不是"史"，也容易被版权与审核牵连
+typename_blacklist = ["影视", "电影", "电视剧", "番剧", "国创", "纪录片", "预告", "资讯", "直播"]
 # 内容安全底线词：标题或标签命中即跳过（判据只看评论区，这里兜一层擦边/低俗内容）
 sensitive_words = ["擦边", "软色情", "性感", "福利姬", "成人向", "露点", "未成年"]
 

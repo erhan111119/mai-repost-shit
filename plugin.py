@@ -39,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.1", description="配置版本")
+    config_version: str = Field(default="1.0.2", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -237,9 +237,16 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"搬史机已装载：目标群 {self.config.target.groups or '（未配置）'}，"
             f"每天 {self.config.target.daily_times} 次，播放区间 "
             f"{self.config.source.play_min}~{self.config.source.play_max}，"
-            f"投递模式 {self.config.target.delivery_mode}，"
-            f"自然语言点播 {self._describe_permission(mode)}"
+            f"投递模式 {self.config.target.delivery_mode}"
         )
+        self.ctx.logger.info(f"自然语言点播权限：{self._describe_permission(mode)}")
+        # 权限模式单独喊一遍：默认全员可触发是个有安全含义的默认值，不能只混在装载行里
+        if mode == "anyone" and self.config.plugin.enabled and self.config.tool.enabled:
+            self.ctx.logger.warning(
+                "自然语言点播当前为「全员可触发」：群里任何人说一句就能让它检索并往群里发视频。"
+                '要收紧就把 [tool].permission 设为 "whitelist" 并填 [tool].whitelist，'
+                "或把 [tool].enabled 设为 false 只留管理员命令 /搬史。"
+            )
 
     async def on_unload(self) -> None:
         """停循环、落盘、关连接。宿主只给 5 秒，全部操作都要快。"""
@@ -350,6 +357,10 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             # 工具回调拿不到发言者，只能靠入站钩子的缓存；拿不到就拒绝，不能放过
             return "没认出你是谁（缓存里没有你的发言），先在群里说句话再叫我"
         if speaker["user_id"] not in allowed:
+            # 缓存的是"该会话最近发言者"，可能不是本次调用者：拒绝的同时丢掉这条缓存，
+            # 逼下一次触发重新经过入站钩子，缩短旧条目可能被蹭到的窗口
+            if self._speakers is not None:
+                self._speakers.forget(stream_id)
             return f"这个功能只对白名单开放（{speaker['user_id']} 不在名单里）"
         return ""
 
@@ -573,6 +584,26 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             return True, f"已发到本会话：{candidate.get('title')}", 1
         return False, f"没成功：{report.get('reason')}", 0
 
+    @staticmethod
+    def _mask_groups(groups: List[str]) -> str:
+        """群号打码：/搬史状态 任何会话都能调，配置里的群号不必暴露完整。
+
+        只保留首 3 位与末 2 位（群号本来就是群里可见的，打码是防止被顺手抄走）。
+        """
+        masked: List[str] = []
+        for raw in groups:
+            value = str(raw).strip()
+            if not value:
+                continue
+            masked.append(value if len(value) <= 5 else f"{value[:3]}****{value[-2:]}")
+        return "、".join(masked) if masked else "（未配置）"
+
+    @staticmethod
+    def _sanitize_bvid(bvid: str) -> str:
+        """文件名只允许字母数字，避免上游返回值里混进路径字符。"""
+        safe = "".join(ch for ch in str(bvid) if ch.isalnum())
+        return safe or "video"
+
     @Command(
         "shitpost_status",
         description="查看今日搬运计划与最近记录",
@@ -598,7 +629,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"{self.config.source.play_min}~{self.config.source.play_max}",
             f"判据：艾特率 ≥ {self.config.judge.at_ratio_threshold:.0%}"
             f" 且评论 ≥ {self.config.judge.min_comments} 条",
-            f"目标群 {self.config.target.groups or '（未配置）'}",
+            f"目标群 {self._mask_groups(self.config.target.groups)}",
             f"投递模式 {self.config.target.delivery_mode}（失败会依次回退，全部失败会报出来）",
             f"自然语言点播：{'开' if self.config.tool.enabled else '关'}"
             f"（{self._describe_permission(self._permission_mode())}，"

@@ -139,7 +139,11 @@ class Pipeline:
             self._logger.info(f"{candidate.bvid} 是多分段视频（{len(segments)} 段），跳过")
             return None
         self._work_dir.mkdir(parents=True, exist_ok=True)
-        dest = self._work_dir / f"{candidate.bvid}_{info.get('quality')}.mp4"
+        # 文件名只保留字母数字：bvid 来自上游接口，不拿它直接拼路径
+        safe_bvid = "".join(ch for ch in candidate.bvid if ch.isalnum()) or "video"
+        quality = info.get("quality")
+        safe_quality = "".join(ch for ch in str(quality) if ch.isdigit()) or "q"
+        dest = self._work_dir / f"{safe_bvid}_{safe_quality}.mp4"
         try:
             written = await self._client.download(
                 str(segments[0].get("url") or ""), dest, int(cfg.max_size_mb) * 1024 * 1024

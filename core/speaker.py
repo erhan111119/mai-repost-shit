@@ -49,6 +49,14 @@ class SpeakerCache:
             return None
         return {"user_id": entry["user_id"], "nickname": entry.get("nickname", "")}
 
+    def forget(self, session_id: str) -> None:
+        """丢掉某会话的缓存条目。
+
+        白名单校验失败时调用：钩子被 skip 掉可能留下旧条目，
+        丢掉它可以让下一次触发必须重新经过入站钩子，减少被蹭的可能。
+        """
+        self._entries.pop(session_id, None)
+
     def purge(self) -> None:
         """清掉过期条目；条目过多时再淘汰最旧的一些。"""
         deadline = time.time() - self._ttl

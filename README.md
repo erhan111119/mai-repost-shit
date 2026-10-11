@@ -142,9 +142,11 @@ max_count = 3            # 单次最多搬几条
 | 配置 | 作用 |
 |---|---|
 | `sensitive_words` | 内容安全底线词，标题或标签命中即跳过（默认含擦边/低俗类词）|
-| `typename_blacklist` | 分区屏蔽名单（`typename`），命中即跳过，默认空、按需补 |
+| `typename_blacklist` | 分区屏蔽名单（`typename`，子串匹配）。默认避开片名/IP 类分区：影视、电影、电视剧、番剧、国创、纪录片、预告、资讯、直播 |
 | `title_blacklist` / `tag_blacklist` / `up_blacklist` | 常规屏蔽词 |
 | `max_duration_seconds` / `max_size_mb` | 时长与体积上限 |
+
+这些只是**兜底**，不是审核：判据本身只看评论区，默认名单拦不住的东西还有很多。
 
 ## 实现上的三条硬规则
 
