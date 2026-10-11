@@ -138,7 +138,7 @@ MaiBot 主仓库里的 `plugins/github_airlibrax_game-update-watcher/core/adapte
 白名单拒绝后该会话的发言者缓存被清掉（再触发走"认不出你是谁"分支，断言通过）；
 群号打码 `976****02`；下载文件名清洗（`../../etc/passwd` → `etcpasswd`，空值 → `video`）。
 
-## 九、37MB 视频导致的三路投递失败（1.0.5 的病根）
+## 九、37MB 视频导致的三路投递失败（1.0.5 的病根；1.0.7 起只剩合并转发一种方式）
 
 真机现象：插件报「投递失败」，紧接着群里却出现了一条视频和一个文件。
 
@@ -162,7 +162,18 @@ MaiBot 主仓库里的 `plugins/github_airlibrax_game-update-watcher/core/adapte
 
 修法见 1.0.5：上限收到 15MB + 下载前用 `size` 预判 + 超限自动降档 + 投递顺序按体积排。
 
-## 十、自然语言点播的身份校验怎么做
+## 十、点播后不回话：用钩子而不是提示词（1.0.7）
+
+模型在调完工具后经常顺口说一句「搬着呢」「刚给你下了几个」，而需求是**群里只出现视频**。
+提示词约束不住，所以改用机制：
+
+- 触发工具时按 `session_id` 记一个「吞回话」窗口（`[tool].suppress_reply_window_seconds`）；
+- 注册 `maisaka.reply.before_post_process` 钩子（BLOCKING + `ErrorPolicy.SKIP`），
+  窗口内把 `kwargs["response"]` 置空 → 宿主判定「Hook 返回了空回复」→ **这次回复不发送**
+  （见 `src/maisaka/builtin_tool/reply.py:494`）。
+- 只吞点播后的**第一条**，随后正常聊天不受影响；开关是 `[tool].suppress_reply`。
+
+## 十一、自然语言点播的身份校验怎么做
 
 Tool 回调里**拿不到点播者的真实 QQ 号**（群聊场景下工具回调的 `user_id` 恒为空，
 这是宿主的既有行为）。但身份不是没法判——**入站钩子带真实发言者**，所以做法是：

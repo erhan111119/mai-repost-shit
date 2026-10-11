@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,6 +30,8 @@ from .core.state import StateStore
 TOOL_REPOST = "repost_shi"
 # 入站钩子：群聊里 Tool 回调拿不到发言者 QQ，只能在这里按会话缓存真实发言者
 RECEIVE_HOOK = "chat.receive.after_process"
+# 回复后处理钩子：把 response 置空即可取消这次回复（宿主会记「返回了空回复」并不发送）
+REPLY_HOOK = "maisaka.reply.before_post_process"
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -39,7 +42,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.6", description="配置版本")
+    config_version: str = Field(default="1.0.7", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -54,12 +57,6 @@ class TargetSectionConfig(PluginConfigBase):
     active_hours: List[int] = Field(default_factory=lambda: [9, 23], description="允许发送的时间范围 [起, 止]（24 小时制）")
     catch_up_minutes: int = Field(default=30, description="错过计划时刻后多久内仍补发，超时则跳过")
     include_header_text: bool = Field(default=True, description="聊天记录里视频上方是否带标题/数据说明")
-    delivery_mode: str = Field(
-        default="forward",
-        description="投递路线：forward=聊天记录内嵌视频（默认）/ video=直接发视频 / file=按文件发。"
-        "嵌套视频段依赖宿主内部实现，宿主更新后若坏掉就换一条路",
-    )
-    notify_on_failure: bool = Field(default=True, description="三条投递路线全失败时，是否往群里说一句（避免安静失败）")
 
 
 class SourceSectionConfig(PluginConfigBase):
@@ -150,6 +147,13 @@ class ToolSectionConfig(PluginConfigBase):
     cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
     daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
     max_count: int = Field(default=3, description="单次点播最多搬几条")
+    suppress_reply: bool = Field(
+        default=True,
+        description="点播后是否吞掉机器人这次的回话（只调用搬史工具、不在群里多说话）",
+    )
+    suppress_reply_window_seconds: int = Field(
+        default=120, description="吞回话的有效窗口（秒）：点播后这段时间内的第一条回复会被取消"
+    )
 
 
 class ShitpostConfig(PluginConfigBase):
@@ -189,8 +193,6 @@ class RunConfig:
     title_blacklist: List[str]
     tag_blacklist: List[str]
     up_blacklist: List[str]
-    delivery_mode: str
-    notify_on_failure: bool
 
 
 class BilibiliShitpostPlugin(MaiBotPlugin):
@@ -210,6 +212,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._manual_busy = False
         # 群聊里工具回调拿不到发言者 QQ，靠入站钩子按会话缓存，供白名单校验
         self._speakers: Optional[SpeakerCache] = None
+        # 会话 -> 吞回话的截止时间：点播后这段时间内的第一条回复会被取消
+        self._reply_suppress: Dict[str, float] = {}
 
     # ===== 生命周期 =====
 
@@ -238,7 +242,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"搬史机已装载：目标群 {self.config.target.groups or '（未配置）'}，"
             f"每天 {self.config.target.daily_times} 次，播放区间 "
             f"{self.config.source.play_min}~{self.config.source.play_max}，"
-            f"投递模式 {self.config.target.delivery_mode}"
+            f"投递方式 聊天记录（合并转发）"
         )
         self.ctx.logger.info(f"自然语言点播权限：{self._describe_permission(mode)}")
         # 权限模式单独喊一遍：默认全员可触发是个有安全含义的默认值，不能只混在装载行里
@@ -254,26 +258,31 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
     async def _check_targets(self) -> None:
         """装载时把目标解析一遍：解析不到就当场告警，别等定时轮到点才静默跳过。
 
-        注意：聊天流要等该群/该人产生过消息才存在，所以这里只能告警、不能禁用功能。
+        注意两点：
+          - 聊天流要等该群/该人产生过消息才存在，所以这里只能告警、不能禁用功能；
+          - 这是**诊断**步骤，任何异常都必须被吞掉——on_load 抛异常会导致整个插件加载失败。
         """
         if self._pipeline is None:
             return
-        resolved: List[str] = []
-        failed: List[str] = []
-        for target in self._run_config().groups:
-            result = await self._pipeline.resolve_target(target)
-            if result is None:
-                failed.append(target)
-            else:
-                resolved.append(f"{target}（{result[1]}）")
-        if resolved:
-            self.ctx.logger.info(f"目标解析成功：{'、'.join(resolved)}")
-        if failed:
-            self.ctx.logger.warning(
-                f"目标解析不到聊天流：{'、'.join(failed)}"
-                "——定时搬运到这些目标时会跳过。群号写错了？或者该群/该人还没产生过消息？"
-                "（目标既可以是群号，也可以是 QQ 号发私聊）"
-            )
+        try:
+            resolved: List[str] = []
+            failed: List[str] = []
+            for target in self._run_config().groups:
+                result = await self._pipeline.resolve_target(target)
+                if result is None:
+                    failed.append(target)
+                else:
+                    resolved.append(f"{target}（{result[1]}）")
+            if resolved:
+                self.ctx.logger.info(f"目标解析成功：{'、'.join(resolved)}")
+            if failed:
+                self.ctx.logger.warning(
+                    f"目标解析不到聊天流：{'、'.join(failed)}"
+                    "——定时搬运到这些目标时会跳过。群号写错了？或者该群/该人还没产生过消息？"
+                    "（目标既可以是群号，也可以是 QQ 号发私聊）"
+                )
+        except Exception as exc:  # noqa: BLE001 - 诊断失败不能拖垮加载
+            self.ctx.logger.warning(f"目标自检失败（不影响插件加载）: {exc!r}")
 
     async def on_unload(self) -> None:
         """停循环、落盘、关连接。宿主只给 5 秒，全部操作都要快。"""
@@ -323,8 +332,6 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             title_blacklist=list(cfg.filters.title_blacklist),
             tag_blacklist=list(cfg.filters.tag_blacklist),
             up_blacklist=list(cfg.filters.up_blacklist),
-            delivery_mode=str(cfg.target.delivery_mode or "forward"),
-            notify_on_failure=cfg.target.notify_on_failure,
         )
 
     # ===== 发言者缓存与点播权限 =====
@@ -356,6 +363,43 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 缓存失败不影响入站
             self.ctx.logger.debug(f"缓存发言者失败（已忽略）: {exc!r}")
         return None
+
+    # ===== 点播后不回话 =====
+
+    @HookHandler(
+        REPLY_HOOK,
+        name="repost_shi_suppress_reply",
+        description="点播搬史后吞掉机器人这一次的回话（只让工具把视频发出去）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+        error_policy=ErrorPolicy.SKIP,  # 抑制失败不该影响正常回复链路
+    )
+    async def suppress_reply_after_tool(self, **kwargs: Any) -> Dict[str, Any]:
+        """把这一次的回复文本置空以取消发送。
+
+        为什么要用钩子而不是只靠提示词：模型经常在调完工具后顺口说一句「搬着呢」
+        「刚给你下了几个」，而用户要的是**群里只出现视频**。宿主对空回复的处理是
+        「不发送并记为 failure」，所以置空就能可靠地吞掉这次回话。
+        只吞「点播之后的第一条」，避免把随后正常的聊天回复也吃掉。
+        """
+        try:
+            if not self.config.tool.suppress_reply:
+                return {"action": "continue"}
+            session_id = str(kwargs.get("session_id") or "")
+            deadline = self._reply_suppress.get(session_id)
+            if not deadline:
+                return {"action": "continue"}
+            if time.time() > deadline:
+                self._reply_suppress.pop(session_id, None)
+                return {"action": "continue"}
+            self._reply_suppress.pop(session_id, None)
+            self.ctx.logger.info("点播搬史后吞掉本次回话（只发视频，不在群里多说话）")
+            modified = dict(kwargs)
+            modified["response"] = ""
+            return {"action": "continue", "modified_kwargs": modified}
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug(f"吞回话失败（已忽略）: {exc!r}")
+            return {"action": "continue"}
 
     def _permission_mode(self) -> str:
         """规范化权限模式，未知值一律按最严格的 whitelist 处理。"""
@@ -474,8 +518,9 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             "从B站搬一条「史」到当前群：专挑评论区艾特率超过 50% 的抽象视频，"
             "下载成 720p 后以聊天记录的形式发出来。"
             "当有人想搬史、要来点抽象的、想看乐子、点名要某类整活/鬼畜视频时调用。"
-            "调用后立刻返回，视频在后台下载并自动发出——不要再追问「要不要」「确定吗」，"
-            "也不要先回一句「我这就去找」；简单应一声「搬着呢」即可。"
+            "调用后立刻返回，视频会在后台下载并自动以聊天记录形式发出。"
+            "**调用之后不要再调用 reply、也不要回任何文字**——群里只会看到搬出来的视频；"
+            "不要追问「要不要」「确定吗」，也不要应一声「搬着呢」，插件会吞掉这次回话。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -530,10 +575,14 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._manual_busy = True
         task = asyncio.create_task(self._manual_share(stream_id, wanted, extra), name="mai-repost-shit-manual")
         task.add_done_callback(self._on_manual_done)
-        taste = f"（挑 {topic.strip()} 那类的）" if extra else ""
+        # 点播后吞掉机器人这一次的回话：只把视频发出去，不在群里多说话
+        if self.config.tool.suppress_reply:
+            self._reply_suppress[stream_id] = time.time() + max(
+                10, self.config.tool.suppress_reply_window_seconds
+            )
         return self._tool_result(
-            f"已经去B站找了{taste}，找到会直接发到这个群，大概要一两分钟。"
-            + (f"这次要搬 {wanted} 条。" if wanted > 1 else "")
+            "已提交搬运，视频会在后台下载并以聊天记录形式自动发到这个群，约一两分钟。"
+            "不要再调用 reply，也不要回复任何文字。"
         )
 
     async def _manual_share(self, stream_id: str, wanted: int, extra_keywords: List[str]) -> None:
@@ -655,7 +704,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"判据：艾特率 ≥ {self.config.judge.at_ratio_threshold:.0%}"
             f" 且评论 ≥ {self.config.judge.min_comments} 条",
             f"目标群 {self._mask_groups(self.config.target.groups)}",
-            f"投递模式 {self.config.target.delivery_mode}（失败会依次回退，全部失败会报出来）",
+            "投递方式 聊天记录（合并转发）；失败只记本地日志，不在群里说话",
             f"自然语言点播：{'开' if self.config.tool.enabled else '关'}"
             f"（{self._describe_permission(self._permission_mode())}，"
             f"冷却 {self.config.tool.cooldown_minutes} 分钟，每群每天 "

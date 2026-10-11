@@ -8,7 +8,7 @@
 # 插件总开关：装好后默认关闭，确认群号填对了再打开
 enabled = false
 # 配置版本（插件自己维护，一般不用动）
-config_version = "1.0.6"
+config_version = "1.0.7"
 
 [target]
 # 投递目标列表：填【群号】或【QQ 号】（填 QQ 号就是发给那个人私聊），不是 session_id；空串会被忽略。
@@ -23,11 +23,6 @@ active_hours = [9, 23]
 catch_up_minutes = 30
 # 聊天记录里视频上方是否带说明（标题 / UP / 播放 / 艾特率 / 链接）
 include_header_text = true
-# 投递路线：forward = 聊天记录内嵌视频（默认）、video = 直接发视频、file = 按文件发。
-# 三条路会自动依次回退；哪天视频发不出来，先改这里换一条路试试。
-delivery_mode = "forward"
-# 三条路都失败时是否往群里说一句（避免安静地什么都不发，只留日志）
-notify_on_failure = true
 
 [source]
 # 关键词池：每轮随机抽几个去搜。屎不挑分区，靠词覆盖 + 艾特率筛。
@@ -98,3 +93,8 @@ cooldown_minutes = 10
 daily_limit_per_group = 3
 # 单次点播最多搬几条
 max_count = 3
+# 点播后是否吞掉机器人这次的回话：只让工具把视频发出去，群里不多一句话。
+# 实现方式是把这次回复的文本置空（宿主遇到空回复就不发送），只吞点播后的第一条。
+suppress_reply = true
+# 吞回话的有效窗口（秒）
+suppress_reply_window_seconds = 120
