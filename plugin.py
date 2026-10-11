@@ -39,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.2", description="配置版本")
+    config_version: str = Field(default="1.0.3", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):

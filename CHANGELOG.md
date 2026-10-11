@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.0.3
+
+- **插件显示名改为中文**：`name` 从 `mai repost shit` 改为 `B站搬史机（mai repost shit）`。
+  插件页/插件详情显示的就是 manifest 的 `name` 字段（`ManifestDisplay` 只有 `icon`，
+  宿主也不读插件 `_locales` 做本地化），所以中文名只能写在这里。
+  仓库名与插件 id 保持不变。
+
 ## 1.0.2
 
 按插件中心第二轮评审建议做的加固（这轮没有阻断项）。
