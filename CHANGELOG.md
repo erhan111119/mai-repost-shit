@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.0.4
+
+- **去掉内容安全过滤**：删除 `[filters].sensitive_words` 与 `[filters].typename_blacklist`
+  两个配置项及其判定逻辑。本插件只搬「史」，判据就是评论区艾特率，不再内置任何内容词表；
+  `[filters]` 只保留用户自己配的标题 / 标签 / UP 屏蔽词。
+- **配置补齐注释**：`config.toml.example` 与生成出的 `config.toml` 每个字段都带上中文说明
+  （含"为什么是这个默认值"的实测依据，例如为什么不要用 `order=click`）。
+
 ## 1.0.3
 
 - **插件显示名改为中文**：`name` 从 `mai repost shit` 改为 `B站搬史机（mai repost shit）`。

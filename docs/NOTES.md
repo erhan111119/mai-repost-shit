@@ -131,6 +131,9 @@ MaiBot 主仓库里的 `plugins/github_airlibrax_game-update-watcher/core/adapte
 文件段、白名单五种情形（认不出发言者拒绝 / 非名单成员拒绝 / 名单成员放行 / 名单为空拒绝 /
 切回 `anyone` 放行）——全部断言通过。
 
+**1.0.4：去掉内容安全过滤**——`sensitive_words` 与 `typename_blacklist` 已删除（用户要求：只搬史，
+不内置任何内容词表）。`[filters]` 只剩标题/标签/UP 三个用户自配屏蔽词。
+
 **1.0.2 加固的验证**：装载时权限模式单列一条日志（`anyone` 且启用中会额外 warning）；
 白名单拒绝后该会话的发言者缓存被清掉（再触发走"认不出你是谁"分支，断言通过）；
 群号打码 `976****02`；下载文件名清洗（`../../etc/passwd` → `etcpasswd`，空值 → `video`）。

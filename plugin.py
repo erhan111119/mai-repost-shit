@@ -20,7 +20,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .core.bili_api import BiliClient
-from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS, DEFAULT_SENSITIVE, DEFAULT_TYPENAME_BLACKLIST
+from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS
 from .core.judge import Judge
 from .core.pipeline import Pipeline
 from .core.speaker import SpeakerCache, normalize_qq
@@ -39,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.3", description="配置版本")
+    config_version: str = Field(default="1.0.4", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -117,15 +117,14 @@ class FilterSectionConfig(PluginConfigBase):
     __ui_icon__ = "ban"
     __ui_order__ = 5
 
-    title_blacklist: List[str] = Field(default_factory=lambda: list(DEFAULT_BLACKLIST), description="标题屏蔽词")
-    tag_blacklist: List[str] = Field(default_factory=list, description="标签屏蔽词")
-    up_blacklist: List[str] = Field(default_factory=list, description="UP 主屏蔽词")
-    typename_blacklist: List[str] = Field(
-        default_factory=lambda: list(DEFAULT_TYPENAME_BLACKLIST), description="分区屏蔽名单（命中即跳过）"
+    title_blacklist: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_BLACKLIST), description="标题屏蔽词（子串匹配，命中即跳过）"
     )
-    sensitive_words: List[str] = Field(
-        default_factory=lambda: list(DEFAULT_SENSITIVE),
-        description="内容安全底线词：标题或标签命中即跳过（判据只看评论区，这里兜一层擦边/低俗内容）",
+    tag_blacklist: List[str] = Field(
+        default_factory=list, description="标签屏蔽词（子串匹配，命中即跳过）"
+    )
+    up_blacklist: List[str] = Field(
+        default_factory=list, description="UP 主屏蔽词（子串匹配，命中即跳过）"
     )
 
 
@@ -186,8 +185,6 @@ class RunConfig:
     title_blacklist: List[str]
     tag_blacklist: List[str]
     up_blacklist: List[str]
-    typename_blacklist: List[str]
-    sensitive_words: List[str]
     delivery_mode: str
     notify_on_failure: bool
 
@@ -296,8 +293,6 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             title_blacklist=list(cfg.filters.title_blacklist),
             tag_blacklist=list(cfg.filters.tag_blacklist),
             up_blacklist=list(cfg.filters.up_blacklist),
-            typename_blacklist=list(cfg.filters.typename_blacklist),
-            sensitive_words=list(cfg.filters.sensitive_words),
             delivery_mode=str(cfg.target.delivery_mode or "forward"),
             notify_on_failure=cfg.target.notify_on_failure,
         )
