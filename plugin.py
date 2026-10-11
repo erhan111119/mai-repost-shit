@@ -39,7 +39,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.4", description="配置版本")
+    config_version: str = Field(default="1.0.5", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -103,7 +103,11 @@ class DownloadSectionConfig(PluginConfigBase):
     __ui_order__ = 4
 
     max_duration_seconds: int = Field(default=240, description="视频时长上限（秒）")
-    max_size_mb: int = Field(default=40, description="下载体积上限（MB）")
+    max_size_mb: int = Field(
+        default=15,
+        description="体积上限（MB）。超限会自动降一档清晰度；实测 37MB 的视频三条投递路线都会被"
+        "平台判失败，所以别放太大",
+    )
     quality_preference: List[int] = Field(
         default_factory=lambda: [64, 32, 16], description="清晰度优先级（64=720P, 32=480P, 16=360P）"
     )

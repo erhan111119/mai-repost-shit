@@ -249,10 +249,14 @@ class BiliClient:
             raise BiliError(f"取播放地址失败 code={data.get('code')} message={data.get('message')}")
         payload = data.get("data") or {}
         durl = payload.get("durl") or []
+        # 保留 size：调用方要拿它在下载前判断体积是否超限
         return {
             "quality": payload.get("quality"),
             "accept_quality": payload.get("accept_quality") or [],
-            "segments": durl,
+            "segments": [
+                {"url": item.get("url"), "size": item.get("size"), "length": item.get("length")}
+                for item in durl
+            ],
         }
 
     async def download(self, url: str, dest: Path, max_bytes: int) -> int:

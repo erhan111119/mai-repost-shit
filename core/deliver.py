@@ -43,20 +43,38 @@ def build_forward_messages(
 class Deliverer:
     """按配置的投递模式发送，失败按顺序回退。"""
 
+    # 超过这个体积就别把视频塞进转发节点了：本地文件大视频在转发节点里最容易失败
+    _FORWARD_SIZE_HINT = 10 * 1024 * 1024
+
     def __init__(self, ctx: Any, logger: Any) -> None:
         self._ctx = ctx
         self._logger = logger
+
+    def _chain(self, mode: str, video_size: int) -> List[str]:
+        """决定投递顺序。
+
+        小文件优先走「聊天记录里带视频」（观感最好）；文件偏大时优先直接发视频——
+        实测 37MB 的视频放进转发节点、直接发、按文件发三条路全被 NapCat 判定失败，
+        所以大文件不适合先试最脆的那条。
+        """
+        if mode == "video":
+            return ["video", "file", "forward"]
+        if mode == "file":
+            return ["file", "video", "forward"]
+        if video_size > self._FORWARD_SIZE_HINT:
+            return ["video", "forward", "file"]
+        return ["forward", "video", "file"]
 
     async def send(self, stream_id: str, candidate: Candidate, video_path: Path, cfg: Any) -> Dict[str, Any]:
         """发送一条候选；返回 {"sent": bool, "method": str, ...}。"""
         bot_qq = str(await self._ctx.config.get("bot.qq_account", "") or "")
         bot_name = str(await self._ctx.config.get("bot.nickname", "") or "麦麦")
         mode = str(getattr(cfg, "delivery_mode", "forward") or "forward").lower()
-        chain = {
-            "forward": ["forward", "video", "file"],
-            "video": ["video", "file", "forward"],
-            "file": ["file", "video", "forward"],
-        }.get(mode, ["forward", "video", "file"])
+        try:
+            video_size = video_path.stat().st_size
+        except OSError:
+            video_size = 0
+        chain = self._chain(mode, video_size)
 
         errors: List[str] = []
         for method in chain:
@@ -95,15 +113,18 @@ class Deliverer:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} 异常: {exc!r}")
 
-        # 三条路都失败：大声失败，别安静地什么都不发
+        # 三条路都失败。注意：宿主的返回值来自平台批量回执，实测出现过「上传其实落到了群里、
+        # 回执却是 FAILED 且 error 为空」的情况，所以这里只陈述事实，不替平台下结论。
         self._logger.error(
-            "投递彻底失败（可能宿主的消息段格式变了，可改 [target].delivery_mode 换一条路）："
+            f"投递失败（{video_size / 1024 / 1024:.1f}MB，三条路都返回失败；"
+            f"体积过大时 NapCat 上传会失败或回报失败，可调小 [download].max_size_mb）："
             + "；".join(errors)
         )
         if getattr(cfg, "notify_on_failure", True):
             try:
                 await self._ctx.send.text(
-                    f"这次没搬成，投递失败了（{len(chain)} 种方式都没成功），详见插件日志。",
+                    "这次没搬成：平台报投递失败。如果群里已经出现视频，忽略这条即可"
+                    "（平台偶尔会上传成功却回报失败）。",
                     stream_id,
                 )
             except Exception as exc:  # noqa: BLE001

@@ -124,35 +124,63 @@ class Pipeline:
     # ===== 下载 =====
 
     async def _download(self, candidate: Candidate, cfg: Any) -> Optional[Path]:
-        """取 720P 播放地址并下载（免登录最高就是 720P，不需要转码）。"""
-        try:
-            info = await self._client.playurl(candidate.bvid, candidate.cid, list(cfg.quality_preference))
-        except BiliError as exc:
-            self._logger.warning(f"{candidate.bvid} 取播放地址失败: {exc}")
+        """按清晰度优先级选一档下载，并保证体积在上限内。
+
+        两个要点（都是实测踩出来的）：
+          1. playurl 会直接给出分段体积 `size`，所以**下载前**就能判断会不会超限，
+             不用先下完再放弃；
+          2. 体积超限时**自动往下降一档**（720P→480P→360P），而不是直接放弃这一条——
+             长一点的视频用低一档照样能发，比丢掉候选划算。
+        """
+        max_bytes = int(cfg.max_size_mb) * 1024 * 1024
+        chosen: Optional[Tuple[Dict[str, Any], int]] = None
+        tried: List[str] = []
+        for qn in list(cfg.quality_preference):
+            try:
+                info = await self._client.playurl(candidate.bvid, candidate.cid, [qn])
+            except BiliError as exc:
+                self._logger.warning(f"{candidate.bvid} 取播放地址（qn={qn}）失败: {exc}")
+                continue
+            segments = info.get("segments") or []
+            if not segments:
+                tried.append(f"qn={qn} 无分段")
+                continue
+            if len(segments) > 1:
+                # 多分段要拼接，本机没有可用的 ffmpeg CLI，直接放弃这一条
+                self._logger.info(f"{candidate.bvid} 是多分段视频（{len(segments)} 段），跳过")
+                return None
+            size = int(segments[0].get("size") or 0)
+            quality = int(info.get("quality") or 0)
+            if size and size > max_bytes:
+                tried.append(f"qn={quality} 约 {size / 1024 / 1024:.1f}MB 超限")
+                continue
+            chosen = (segments[0], quality)
+            if qn != list(cfg.quality_preference)[0]:
+                self._logger.info(
+                    f"{candidate.bvid} 高清晰度体积超限，降到 qn={quality}"
+                    f"（约 {size / 1024 / 1024:.1f}MB）"
+                )
+            break
+        if chosen is None:
+            reason = "；".join(tried) or "没有可用清晰度"
+            self._logger.info(f"{candidate.bvid} 放弃下载：{reason}（上限 {cfg.max_size_mb}MB）")
             return None
-        segments = info.get("segments") or []
-        if not segments:
-            self._logger.warning(f"{candidate.bvid} 没有可下载的分段")
-            return None
-        if len(segments) > 1:
-            # 多分段要拼接，本机没有可用的 ffmpeg CLI，直接放弃这一条
-            self._logger.info(f"{candidate.bvid} 是多分段视频（{len(segments)} 段），跳过")
-            return None
+
+        segment, quality = chosen
         self._work_dir.mkdir(parents=True, exist_ok=True)
         # 文件名只保留字母数字：bvid 来自上游接口，不拿它直接拼路径
         safe_bvid = "".join(ch for ch in candidate.bvid if ch.isalnum()) or "video"
-        quality = info.get("quality")
         safe_quality = "".join(ch for ch in str(quality) if ch.isdigit()) or "q"
         dest = self._work_dir / f"{safe_bvid}_{safe_quality}.mp4"
         try:
-            written = await self._client.download(
-                str(segments[0].get("url") or ""), dest, int(cfg.max_size_mb) * 1024 * 1024
-            )
+            written = await self._client.download(str(segment.get("url") or ""), dest, max_bytes)
         except BiliError as exc:
             self._logger.warning(f"{candidate.bvid} 下载失败: {exc}")
             dest.unlink(missing_ok=True)
             return None
-        self._logger.info(f"{candidate.bvid} 下载完成 {written / 1024 / 1024:.1f}MB → {dest.name}")
+        self._logger.info(
+            f"{candidate.bvid} 下载完成 {written / 1024 / 1024:.1f}MB（qn={quality}）→ {dest.name}"
+        )
         return dest
 
     # ===== 主流程 =====
