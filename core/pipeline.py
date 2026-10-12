@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 from dataclasses import asdict
@@ -206,19 +207,31 @@ class Pipeline:
         否则发到配置里的所有群。extra_keywords 是点播的口味词。
         channel 决定用哪套判据：shi = 评论区艾特率、pretty = 收藏率+短时长+只二次元。
         """
-        report: Dict[str, Any] = {"sent": False, "reason": "", "candidate": None, "targets": []}
-        if channel == "pretty":
-            if self._pretty is None:
-                report["reason"] = "好看频道未初始化"
-                return report
-            candidate = await self._pretty.pick(cfg, extra_keywords)
+        report: Dict[str, Any] = {"sent": False, "reason": "", "candidate": None, "targets": [], "attempts": 0}
+        # 一轮没找到就继续找：每次换关键词/翻页重新搜，试到 rounds 轮为止
+        rounds = max(1, int(getattr(cfg, "retry_rounds", 1) or 1))
+        gap = max(0, int(getattr(cfg, "retry_gap_seconds", 0) or 0))
+        candidate: Optional[Candidate] = None
+        for attempt in range(1, rounds + 1):
+            report["attempts"] = attempt
+            if channel == "pretty":
+                if self._pretty is None:
+                    report["reason"] = "好看频道未初始化"
+                    return report
+                candidate = await self._pretty.pick(cfg, extra_keywords)
+                if candidate is not None:
+                    # 好看频道没有"花请求的检查"这一步，挑出来就标记，避免下载失败时每轮都挑同一条
+                    self._store.mark_checked(candidate.bvid)
+            else:
+                candidate = await self._pick(cfg, extra_keywords)
             if candidate is not None:
-                # 好看频道没有"花请求的检查"这一步，挑出来就标记，避免下载失败时每轮都挑同一条
-                self._store.mark_checked(candidate.bvid)
-        else:
-            candidate = await self._pick(cfg, extra_keywords)
+                break
+            if attempt < rounds:
+                self._logger.info(f"第 {attempt}/{rounds} 轮没找到符合条件的，继续找…")
+                if gap:
+                    await asyncio.sleep(gap)
         if candidate is None:
-            report["reason"] = "本轮没有通过判据的候选"
+            report["reason"] = f"找了 {report['attempts']} 轮都没找到符合条件的候选"
             return report
 
         video_path = await self._download(candidate, cfg)

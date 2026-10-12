@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.7", description="配置版本")
+    config_version: str = Field(default="1.1.8", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -232,6 +232,20 @@ class PrettySectionConfig(PluginConfigBase):
     )
 
 
+class RetrySectionConfig(PluginConfigBase):
+    """没找到就继续找。"""
+
+    __ui_label__ = "重试"
+    __ui_icon__ = "rotate-cw"
+    __ui_order__ = 8
+
+    rounds: int = Field(
+        default=3,
+        description="一轮没找到符合条件的候选时，继续换关键词/翻页再找，最多试几轮",
+    )
+    gap_seconds: int = Field(default=15, description="两次尝试之间的间隔（秒），0 表示不等待")
+
+
 class ShitpostConfig(PluginConfigBase):
     """插件配置。"""
 
@@ -243,6 +257,7 @@ class ShitpostConfig(PluginConfigBase):
     filters: FilterSectionConfig = Field(default_factory=FilterSectionConfig)
     tool: ToolSectionConfig = Field(default_factory=ToolSectionConfig)
     pretty: PrettySectionConfig = Field(default_factory=PrettySectionConfig)
+    retry: RetrySectionConfig = Field(default_factory=RetrySectionConfig)
 
 
 @dataclass
@@ -283,6 +298,8 @@ class RunConfig:
     pretty_rate_metric: str
     pretty_min_favorite_rate: float
     pretty_typename_whitelist: List[str]
+    retry_rounds: int
+    retry_gap_seconds: int
     pretty_real_blacklist: List[str]
     pretty_block_words: List[str]
 
@@ -448,6 +465,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             pretty_rate_metric=str(cfg.pretty.favorite_rate_metric or "fav_like"),
             pretty_min_favorite_rate=cfg.pretty.min_favorite_rate,
             pretty_typename_whitelist=list(cfg.pretty.typename_whitelist),
+            retry_rounds=cfg.retry.rounds,
+            retry_gap_seconds=cfg.retry.gap_seconds,
             pretty_real_blacklist=list(cfg.pretty.real_blacklist),
             pretty_block_words=list(cfg.pretty.block_words),
         )
