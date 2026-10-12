@@ -56,6 +56,9 @@ class Candidate:
     reject_reason: str = ""
     # 频道：shi = 搬史（按评论区艾特率），pretty = 来点好看的（按收藏率、短时长、只二次元）
     channel: str = "shi"
+    # 好看频道：算好的收藏率与它用的口径（fav_like = 收藏/点赞、fav_play = 收藏/播放）
+    favorite_ratio: float = 0.0
+    favorite_metric: str = "fav_like"
 
     def header_text(self) -> str:
         """合并转发里视频上方的那段说明（按频道给不同的数据口径）。"""
@@ -67,8 +70,8 @@ class Candidate:
             f"时长 {minutes}分{seconds}秒　"
         )
         if self.channel == "pretty":
-            ratio = self.favorite / self.play if self.play else 0.0
-            tail = f"收藏率 {ratio:.1%}\n"
+            label = "收藏/点赞" if self.favorite_metric == "fav_like" else "收藏/播放"
+            tail = f"收藏率 {self.favorite_ratio:.0%}（{label}）\n"
         else:
             tail = f"评论区艾特率 {self.at_ratio:.0%}（{self.at_count}/{self.comment_count}）\n"
         return f"{common}{tail}https://www.bilibili.com/video/{self.bvid}"

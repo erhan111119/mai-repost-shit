@@ -60,14 +60,27 @@ class PrettyPicker:
         hit = self._hit_real_people(f"{title} {tag}", cfg.pretty_block_words)
         if hit:
             return f"教程/讲解类内容（命中「{hit}」）"
-        play = int(item.get("play") or 0)
-        favorite = int(item.get("favorites") or 0)
-        if not play:
-            return "缺播放数据"
-        ratio = favorite / play
-        if ratio < cfg.pretty_min_favorite_play:
-            return f"收藏率不够（{ratio:.1%} < {cfg.pretty_min_favorite_play:.1%}）"
+        ratio = self.rate_of(item, cfg)
+        if ratio is None:
+            return "缺收藏/点赞/播放数据"
+        label = "收藏/点赞" if cfg.pretty_rate_metric == "fav_like" else "收藏/播放"
+        if ratio < cfg.pretty_min_favorite_rate:
+            return (
+                f"收藏率不够（{label} {ratio:.0%} < {cfg.pretty_min_favorite_rate:.0%}）"
+            )
         return None
+
+    @staticmethod
+    def rate_of(item: Dict[str, Any], cfg: Any) -> Optional[float]:
+        """按配置的口径算收藏率；分母缺数据时返回 None。"""
+        play = int(item.get("play") or 0)
+        like = int(item.get("like") or 0)
+        favorite = int(item.get("favorites") or 0)
+        if not favorite:
+            return None
+        if cfg.pretty_rate_metric == "fav_like":
+            return favorite / like if like else None
+        return favorite / play if play else None
 
     async def pick(self, cfg: Any, extra_keywords: Sequence[str] = ()) -> Optional[Candidate]:
         """从搜索结果里挑一条最好的（收藏率最高的那条，同分随机）。"""
@@ -112,10 +125,8 @@ class PrettyPicker:
             if reason:
                 self._logger.debug(f"[好看] 跳过 {bvid}：{reason}")
                 continue
-            play = int(item.get("play") or 0)
-            favorite = int(item.get("favorites") or 0)
             duration = parse_duration(str(item.get("duration") or ""))
-            ratio = favorite / play if play else 0.0
+            ratio = self.rate_of(item, cfg) or 0.0
             # 排序键里混一个随机数：收藏率相同时随机挑，避免每次都搬同一条
             ready.append((ratio, random.random(), item, duration))
         self._logger.info(f"[好看] 候选 {len(found)} 条，合格 {len(ready)} 条")
@@ -149,10 +160,15 @@ class PrettyPicker:
             candidate.typename = str((detail or {}).get("tname") or candidate.typename)
             candidate.author = str(((detail or {}).get("owner") or {}).get("name") or candidate.author)
             candidate.title = str((detail or {}).get("title") or candidate.title)
-            real_ratio = candidate.favorite / candidate.play if candidate.play else 0.0
+            real_ratio = self.rate_of(
+                {"play": candidate.play, "like": candidate.like, "favorites": candidate.favorite}, cfg
+            ) or 0.0
+            candidate.favorite_ratio = real_ratio
+            candidate.favorite_metric = cfg.pretty_rate_metric
+            metric_label = "收藏/点赞" if cfg.pretty_rate_metric == "fav_like" else "收藏/播放"
             self._logger.info(
-                f"[好看] 选中 {candidate.bvid} 收藏率={real_ratio:.1%} 时长={candidate.duration}s"
-                f" 分区={candidate.typename} {candidate.title[:24]}"
+                f"[好看] 选中 {candidate.bvid} 收藏率={real_ratio:.0%}（{metric_label}）"
+                f" 时长={candidate.duration}s 分区={candidate.typename} {candidate.title[:24]}"
             )
             return candidate
         self._logger.info("[好看] 候选都拿不到可用播放信息")

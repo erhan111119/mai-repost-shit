@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.2", description="配置版本")
+    config_version: str = Field(default="1.1.3", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -201,10 +201,16 @@ class PrettySectionConfig(PluginConfigBase):
     play_min: int = Field(default=10000, description="播放量下限")
     play_max: int = Field(default=500000, description="播放量上限")
     max_duration_seconds: int = Field(default=120, description="时长上限（秒）——「时长不长」就是这个")
-    min_favorite_play: float = Field(
-        default=0.05,
-        description="收藏率（收藏/播放）下限。实测这批候选：中位 0.039、70% 位 0.071、90% 位 0.130，"
-        "0.05 大约留下四成",
+    favorite_rate_metric: str = Field(
+        default="fav_like",
+        description="收藏率用哪个分母：fav_like = 收藏/点赞（默认）、fav_play = 收藏/播放。"
+        "实测收藏/播放最高只到 40%、73 条里没有一条到 50%（收藏不可能比播放多一半）；"
+        "而收藏/点赞中位就有 52%、≥50% 的有 39 条，所以门槛要设在点赞上",
+    )
+    min_favorite_rate: float = Field(
+        default=0.5,
+        description="收藏率下限。按 fav_like 口径：≥50% 约留一半候选，≥80% 约留三成，"
+        "≥100%（收藏比点赞还多）约留两成",
     )
     typename_whitelist: List[str] = Field(
         default_factory=lambda: list(DEFAULT_PRETTY_TYPENAME),
@@ -270,7 +276,8 @@ class RunConfig:
     pretty_play_min: int
     pretty_play_max: int
     pretty_max_duration_seconds: int
-    pretty_min_favorite_play: float
+    pretty_rate_metric: str
+    pretty_min_favorite_rate: float
     pretty_typename_whitelist: List[str]
     pretty_real_blacklist: List[str]
     pretty_block_words: List[str]
@@ -330,8 +337,9 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "频道：搬史（评论区艾特率"
             f" ≥ {self.config.judge.at_ratio_threshold:.0%}）"
-            f" + 来点好看的（收藏率 ≥ {self.config.pretty.min_favorite_play:.0%}、时长 ≤ "
-            f"{self.config.pretty.max_duration_seconds}s、只二次元，"
+            f" + 来点好看的（收藏率 ≥ {self.config.pretty.min_favorite_rate:.0%}"
+            f"（{'收藏/点赞' if self.config.pretty.favorite_rate_metric == 'fav_like' else '收藏/播放'}）、"
+            f"时长 ≤ {self.config.pretty.max_duration_seconds}s、只二次元，"
             f"{'开' if self.config.pretty.enabled else '关'}）"
         )
         # 权限模式单独喊一遍：默认全员可触发是个有安全含义的默认值，不能只混在装载行里
@@ -433,7 +441,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             pretty_play_min=cfg.pretty.play_min,
             pretty_play_max=cfg.pretty.play_max,
             pretty_max_duration_seconds=cfg.pretty.max_duration_seconds,
-            pretty_min_favorite_play=cfg.pretty.min_favorite_play,
+            pretty_rate_metric=str(cfg.pretty.favorite_rate_metric or "fav_like"),
+            pretty_min_favorite_rate=cfg.pretty.min_favorite_rate,
             pretty_typename_whitelist=list(cfg.pretty.typename_whitelist),
             pretty_real_blacklist=list(cfg.pretty.real_blacklist),
             pretty_block_words=list(cfg.pretty.block_words),
@@ -1005,7 +1014,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             for record in reversed(recent):
                 when = datetime.fromtimestamp(record.get("sent_at", 0)).strftime("%m-%d %H:%M")
                 if str(record.get("channel") or "shi") == "pretty":
-                    metric = f"收藏率 {float(record.get('favorite_play') or 0):.1%}"
+                    label = "收藏/点赞" if str(record.get("favorite_metric") or "fav_like") == "fav_like" else "收藏/播放"
+                    metric = f"收藏率 {float(record.get('favorite_ratio') or 0):.0%}（{label}）"
                 else:
                     metric = f"艾特率 {float(record.get('at_ratio') or 0):.0%}"
                 lines.append(f"· {when} {str(record.get('title') or '')[:24]}（{metric}）")
