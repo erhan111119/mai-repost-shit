@@ -262,6 +262,11 @@ class Pipeline:
                     "play": candidate.play,
                     "at_ratio": round(candidate.at_ratio, 3),
                     "comment_count": candidate.comment_count,
+                    # 好看频道不看艾特率，记录里存收藏率，状态命令按频道显示对应指标
+                    "channel": candidate.channel,
+                    "favorite_play": round(candidate.favorite / candidate.play, 4)
+                    if candidate.play
+                    else 0.0,
                     "sent_at": int(time.time()),
                     "groups": [item["group"] for item in report["targets"] if item.get("sent")],
                 }

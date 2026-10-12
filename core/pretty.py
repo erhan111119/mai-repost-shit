@@ -57,6 +57,9 @@ class PrettyPicker:
         hit = self._hit_real_people(f"{title} {tag}", cfg.pretty_real_blacklist)
         if hit:
             return f"疑似真人内容（命中「{hit}」）"
+        hit = self._hit_real_people(f"{title} {tag}", cfg.pretty_block_words)
+        if hit:
+            return f"教程/讲解类内容（命中「{hit}」）"
         play = int(item.get("play") or 0)
         favorite = int(item.get("favorites") or 0)
         if not play:

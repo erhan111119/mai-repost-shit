@@ -24,6 +24,7 @@ from .core.bili_api import BiliClient
 from .core.defaults import (
     DEFAULT_BLACKLIST,
     DEFAULT_KEYWORDS,
+    DEFAULT_PRETTY_BLOCK_WORDS,
     DEFAULT_PRETTY_KEYWORDS,
     DEFAULT_PRETTY_REAL_BLOCK,
     DEFAULT_PRETTY_TYPENAME,
@@ -62,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.1", description="配置版本")
+    config_version: str = Field(default="1.1.2", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -213,6 +214,10 @@ class PrettySectionConfig(PluginConfigBase):
         default_factory=lambda: list(DEFAULT_PRETTY_REAL_BLOCK),
         description="真人向屏蔽词：标题或标签命中即跳过",
     )
+    block_words: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_PRETTY_BLOCK_WORDS),
+        description="教程/讲解类屏蔽词：标题或标签命中即跳过（只想要好看的画面，不想要教学）",
+    )
     cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
     daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
 
@@ -268,6 +273,7 @@ class RunConfig:
     pretty_min_favorite_play: float
     pretty_typename_whitelist: List[str]
     pretty_real_blacklist: List[str]
+    pretty_block_words: List[str]
 
 
 class BilibiliShitpostPlugin(MaiBotPlugin):
@@ -430,6 +436,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             pretty_min_favorite_play=cfg.pretty.min_favorite_play,
             pretty_typename_whitelist=list(cfg.pretty.typename_whitelist),
             pretty_real_blacklist=list(cfg.pretty.real_blacklist),
+            pretty_block_words=list(cfg.pretty.block_words),
         )
 
     # ===== 发言者缓存与点播权限 =====
@@ -997,10 +1004,11 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             lines.append("最近搬过：")
             for record in reversed(recent):
                 when = datetime.fromtimestamp(record.get("sent_at", 0)).strftime("%m-%d %H:%M")
-                lines.append(
-                    f"· {when} {str(record.get('title') or '')[:24]}"
-                    f"（艾特率 {float(record.get('at_ratio') or 0):.0%}）"
-                )
+                if str(record.get("channel") or "shi") == "pretty":
+                    metric = f"收藏率 {float(record.get('favorite_play') or 0):.1%}"
+                else:
+                    metric = f"艾特率 {float(record.get('at_ratio') or 0):.0%}"
+                lines.append(f"· {when} {str(record.get('title') or '')[:24]}（{metric}）")
         text = "\n".join(lines)
         if stream_id:
             await self.ctx.send.text(text, stream_id)
