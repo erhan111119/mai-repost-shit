@@ -21,13 +21,21 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .core.bili_api import BiliClient
-from .core.defaults import DEFAULT_BLACKLIST, DEFAULT_KEYWORDS
+from .core.defaults import (
+    DEFAULT_BLACKLIST,
+    DEFAULT_KEYWORDS,
+    DEFAULT_PRETTY_KEYWORDS,
+    DEFAULT_PRETTY_REAL_BLOCK,
+    DEFAULT_PRETTY_TYPENAME,
+)
 from .core.judge import Judge
 from .core.pipeline import Pipeline
+from .core.pretty import PrettyPicker
 from .core.speaker import SpeakerCache, normalize_qq
 from .core.state import StateStore
 
 TOOL_REPOST = "repost_shi"
+TOOL_PRETTY = "repost_pretty"
 # 入站钩子：群聊里 Tool 回调拿不到发言者 QQ，只能在这里按会话缓存真实发言者
 RECEIVE_HOOK = "chat.receive.after_process"
 # 回复后处理钩子：把 response 置空即可取消这次回复（宿主会记「返回了空回复」并不发送）
@@ -42,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.0.8", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -162,6 +170,41 @@ class ToolSectionConfig(PluginConfigBase):
     )
 
 
+class PrettySectionConfig(PluginConfigBase):
+    """「来点好看的」频道：短时长 + 高收藏率 + 只二次元。"""
+
+    __ui_label__ = "来点好看的"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 7
+
+    enabled: bool = Field(default=True, description="是否允许用自然语言点播「好看的」（二次元向）")
+    keywords: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_PRETTY_KEYWORDS), description="关键词池，每轮随机抽几个"
+    )
+    keywords_per_run: int = Field(default=6, description="每轮用几个关键词搜")
+    orders: List[str] = Field(default_factory=lambda: ["totalrank", "pubdate"], description="搜索排序方式")
+    page_max: int = Field(default=3, description="每个关键词随机翻到第几页（上限）")
+    window_hours: List[int] = Field(default_factory=lambda: [72, 720], description="发布时间窗 [最近, 最远]（小时）")
+    play_min: int = Field(default=10000, description="播放量下限")
+    play_max: int = Field(default=500000, description="播放量上限")
+    max_duration_seconds: int = Field(default=120, description="时长上限（秒）——「时长不长」就是这个")
+    min_favorite_play: float = Field(
+        default=0.05,
+        description="收藏率（收藏/播放）下限。实测这批候选：中位 0.039、70% 位 0.071、90% 位 0.130，"
+        "0.05 大约留下四成",
+    )
+    typename_whitelist: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_PRETTY_TYPENAME),
+        description="子分区白名单（子串匹配）：只放二次元向分区，真人向（仿妆cos/颜值/舞蹈综合/特摄）不在里面",
+    )
+    real_blacklist: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_PRETTY_REAL_BLOCK),
+        description="真人向屏蔽词：标题或标签命中即跳过",
+    )
+    cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
+    daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
+
+
 class ShitpostConfig(PluginConfigBase):
     """插件配置。"""
 
@@ -172,6 +215,7 @@ class ShitpostConfig(PluginConfigBase):
     download: DownloadSectionConfig = Field(default_factory=DownloadSectionConfig)
     filters: FilterSectionConfig = Field(default_factory=FilterSectionConfig)
     tool: ToolSectionConfig = Field(default_factory=ToolSectionConfig)
+    pretty: PrettySectionConfig = Field(default_factory=PrettySectionConfig)
 
 
 @dataclass
@@ -200,6 +244,18 @@ class RunConfig:
     title_blacklist: List[str]
     tag_blacklist: List[str]
     up_blacklist: List[str]
+    # 「来点好看的」频道
+    pretty_keywords: List[str]
+    pretty_keywords_per_run: int
+    pretty_orders: List[str]
+    pretty_page_max: int
+    pretty_window_hours: List[int]
+    pretty_play_min: int
+    pretty_play_max: int
+    pretty_max_duration_seconds: int
+    pretty_min_favorite_play: float
+    pretty_typename_whitelist: List[str]
+    pretty_real_blacklist: List[str]
 
 
 class BilibiliShitpostPlugin(MaiBotPlugin):
@@ -242,6 +298,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             store=self._store,
             logger=self.ctx.logger,
             work_dir=work_dir,
+            pretty=PrettyPicker(self._client, self._store, self.ctx.logger),
         )
         self._loop_task = asyncio.create_task(self._schedule_loop(), name="mai-repost-shit-scheduler")
         mode = self._permission_mode()
@@ -252,6 +309,13 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             f"投递方式 聊天记录（合并转发）"
         )
         self.ctx.logger.info(f"自然语言点播权限：{self._describe_permission(mode)}")
+        self.ctx.logger.info(
+            "频道：搬史（评论区艾特率"
+            f" ≥ {self.config.judge.at_ratio_threshold:.0%}）"
+            f" + 来点好看的（收藏率 ≥ {self.config.pretty.min_favorite_play:.0%}、时长 ≤ "
+            f"{self.config.pretty.max_duration_seconds}s、只二次元，"
+            f"{'开' if self.config.pretty.enabled else '关'}）"
+        )
         # 权限模式单独喊一遍：默认全员可触发是个有安全含义的默认值，不能只混在装载行里
         if mode == "anyone" and self.config.plugin.enabled and self.config.tool.enabled:
             self.ctx.logger.warning(
@@ -307,7 +371,10 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         """配置热重载：判据的阈值要跟着换。"""
         self.ctx.logger.info(f"配置已更新（scope={scope} version={version}），下一轮生效")
         if self._client is not None and self._pipeline is not None:
-            self._pipeline.set_judge(Judge(self._client, self._run_config(), self.ctx.logger))
+            self._pipeline.set_judge(
+                Judge(self._client, self._run_config(), self.ctx.logger),
+                PrettyPicker(self._client, self._store, self.ctx.logger) if self._store else None,
+            )
 
     # ===== 配置快照 =====
 
@@ -340,6 +407,17 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             title_blacklist=list(cfg.filters.title_blacklist),
             tag_blacklist=list(cfg.filters.tag_blacklist),
             up_blacklist=list(cfg.filters.up_blacklist),
+            pretty_keywords=list(cfg.pretty.keywords),
+            pretty_keywords_per_run=cfg.pretty.keywords_per_run,
+            pretty_orders=list(cfg.pretty.orders),
+            pretty_page_max=cfg.pretty.page_max,
+            pretty_window_hours=list(cfg.pretty.window_hours)[:2] or [72, 720],
+            pretty_play_min=cfg.pretty.play_min,
+            pretty_play_max=cfg.pretty.play_max,
+            pretty_max_duration_seconds=cfg.pretty.max_duration_seconds,
+            pretty_min_favorite_play=cfg.pretty.min_favorite_play,
+            pretty_typename_whitelist=list(cfg.pretty.typename_whitelist),
+            pretty_real_blacklist=list(cfg.pretty.real_blacklist),
         )
 
     # ===== 发言者缓存与点播权限 =====
@@ -496,6 +574,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         cfg: RunConfig,
         override_stream: str = "",
         extra_keywords: Sequence[str] = (),
+        channel: str = "shi",
     ) -> Dict[str, Any]:
         """跑一轮并汇报结果，带重入保护。"""
         if self._pipeline is None:
@@ -505,7 +584,10 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._running = True
         try:
             report = await self._pipeline.run_once(
-                cfg, override_stream=override_stream, extra_keywords=extra_keywords
+                cfg,
+                override_stream=override_stream,
+                extra_keywords=extra_keywords,
+                channel=channel,
             )
         finally:
             self._running = False
@@ -593,12 +675,91 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             "不要再调用 reply，也不要回复任何文字。"
         )
 
-    async def _manual_share(self, stream_id: str, wanted: int, extra_keywords: List[str]) -> None:
+    @Tool(
+        TOOL_PRETTY,
+        brief_description=(
+            "从B站搬一条「好看的」二次元视频到当前群：只要纸片人（MMD/手书/MAD/AMV/插画/动画），"
+            "不要真人出镜；挑时长 2 分钟以内、收藏率高的。"
+            "当有人说「来点涩的/来点色的/来点黄的/来点好看的/来点好康的/来点二次元」这类话时调用。"
+            "**调用之后不要再调用 reply、也不要回任何文字**——插件会吞掉这次回话，群里只出现视频。"
+            "不要追问「要哪种」，不要应一声「找着呢」。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="topic",
+                param_type=ToolParamType.STRING,
+                description="对方点名的类型，例如「MMD」「手书」「插画」「壁纸」「初音」；没点名就留空",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="count",
+                param_type=ToolParamType.INTEGER,
+                description="要几条，默认 1；对方说「来几个」时给 2 或 3",
+                required=False,
+                default=1,
+            ),
+        ],
+        visibility="visible",
+        chat_scope="all",
+    )
+    async def tool_pretty(self, topic: str = "", count: int = 1, **kwargs: Any) -> Dict[str, Any]:
+        """用自然语言点播「好看的」二次元视频。"""
+        tunnel = "pretty"
+        stream_id = str(kwargs.get("stream_id") or "")
+        if not stream_id:
+            return self._tool_result("拿不到当前会话，没法找。", tunnel)
+        if not self.config.plugin.enabled:
+            return self._tool_result("搬视频功能没开（插件配置里 [plugin].enabled 还是 false）。", tunnel)
+        if not self.config.pretty.enabled:
+            return self._tool_result("「好看的」频道被关掉了，要用的话让管理员开 [pretty].enabled。", tunnel)
+        denied = self._permission_denied_reason(stream_id)
+        if denied:
+            return self._tool_result(f"先不搬：{denied}。管理员可以用 /搬好看 指令。", tunnel)
+        if self._store is None:
+            return self._tool_result("插件还没就绪，稍后再试。", tunnel)
+        if self._manual_busy or self._running:
+            return self._tool_result("正在搬上一条，等它发出来再说。", tunnel)
+
+        limit = max(1, self.config.tool.max_count)
+        wanted = max(1, min(int(count or 1), limit))
+        # 冷却与配额按频道分开记，免得点播好看的把搬史的额度吃掉
+        block = self._store.manual_block_reason(
+            f"{stream_id}#pretty",
+            cooldown_minutes=self.config.pretty.cooldown_minutes,
+            daily_limit=self.config.pretty.daily_limit_per_group,
+        )
+        if block:
+            return self._tool_result(f"先不搬：{block}。", tunnel)
+
+        self._store.record_manual(f"{stream_id}#pretty")
+        await self._store.save()
+        extra = [topic.strip()] if topic and topic.strip() else []
+        self._manual_busy = True
+        task = asyncio.create_task(
+            self._manual_share(stream_id, wanted, extra, channel=tunnel),
+            name="mai-repost-shit-pretty",
+        )
+        task.add_done_callback(self._on_manual_done)
+        if self.config.tool.suppress_reply:
+            self._reply_suppress[stream_id] = time.time() + max(
+                10, self.config.tool.suppress_reply_window_seconds
+            )
+        return self._tool_result(
+            "已提交，视频会在后台下载并以聊天记录形式自动发到这个群。"
+            "不要再调用 reply，也不要回复任何文字。",
+            tunnel,
+        )
+
+    async def _manual_share(
+        self, stream_id: str, wanted: int, extra_keywords: List[str], channel: str = "shi"
+    ) -> None:
         """后台跑完手动点播：每条都是完整的检索→判据→下载→投递。"""
         try:
             cfg = self._run_config()
             for index in range(wanted):
-                report = await self._run_and_report(cfg, override_stream=stream_id, extra_keywords=extra_keywords)
+                report = await self._run_and_report(
+                    cfg, override_stream=stream_id, extra_keywords=extra_keywords, channel=channel
+                )
                 if report.get("sent"):
                     continue
                 reason = str(report.get("reason") or "没找到合适的")
@@ -622,9 +783,9 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             self.ctx.logger.error(f"点播任务失败: {exc!r}")
 
     @staticmethod
-    def _tool_result(content: str) -> Dict[str, Any]:
+    def _tool_result(content: str, tool_name: str = TOOL_REPOST) -> Dict[str, Any]:
         """构造 Tool 返回值（内容会进入模型上下文）。"""
-        return {"name": TOOL_REPOST, "content": content}
+        return {"name": tool_name, "content": content}
 
     # ===== 命令 =====
 
@@ -685,6 +846,27 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         """文件名只允许字母数字，避免上游返回值里混进路径字符。"""
         safe = "".join(ch for ch in str(bvid) if ch.isalnum())
         return safe or "video"
+
+    @Command(
+        "pretty_here",
+        description="立刻搬一条「好看的」二次元视频到当前会话（需管理员）",
+        pattern=r"^/搬好看$",
+        permission="operator",
+    )
+    async def cmd_pretty_here(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
+        """把一条好看的二次元视频发到当前会话。"""
+        del kwargs
+        if not stream_id:
+            return False, "拿不到当前会话 ID", 0
+        if not self.config.pretty.enabled:
+            return False, "「好看的」频道未启用", 0
+        report = await self._run_and_report(
+            self._run_config(), override_stream=stream_id, channel="pretty"
+        )
+        if report.get("sent"):
+            candidate = report.get("candidate") or {}
+            return True, f"已搬：{candidate.get('title')}", 1
+        return False, f"没搬成：{report.get('reason')}", 0
 
     @Command(
         "shitpost_status",

@@ -54,18 +54,24 @@ class Candidate:
     at_count: int = 0
     comment_count: int = 0
     reject_reason: str = ""
+    # 频道：shi = 搬史（按评论区艾特率），pretty = 来点好看的（按收藏率、短时长、只二次元）
+    channel: str = "shi"
 
     def header_text(self) -> str:
-        """合并转发里视频上方的那段说明。"""
+        """合并转发里视频上方的那段说明（按频道给不同的数据口径）。"""
         minutes, seconds = divmod(self.duration, 60)
-        return (
+        common = (
             f"【{self.title}】\n"
             f"UP：{self.author}　分区：{self.typename}\n"
             f"播放 {self.play:,}　点赞 {self.like:,}　收藏 {self.favorite:,}\n"
-            f"时长 {minutes}分{seconds}秒　评论区艾特率 {self.at_ratio:.0%}"
-            f"（{self.at_count}/{self.comment_count}）\n"
-            f"https://www.bilibili.com/video/{self.bvid}"
+            f"时长 {minutes}分{seconds}秒　"
         )
+        if self.channel == "pretty":
+            ratio = self.favorite / self.play if self.play else 0.0
+            tail = f"收藏率 {ratio:.1%}\n"
+        else:
+            tail = f"评论区艾特率 {self.at_ratio:.0%}（{self.at_count}/{self.comment_count}）\n"
+        return f"{common}{tail}https://www.bilibili.com/video/{self.bvid}"
 
 
 class Judge:

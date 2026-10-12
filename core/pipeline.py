@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .bili_api import BiliClient, BiliError
 from .deliver import Deliverer, append_context
 from .judge import Candidate, Judge
+from .pretty import PrettyPicker
 from .state import StateStore
 
 
@@ -30,18 +31,22 @@ class Pipeline:
         store: StateStore,
         logger: Any,
         work_dir: Path,
+        pretty: Optional[PrettyPicker] = None,
     ) -> None:
         self._ctx = ctx
         self._client = client
         self._judge = judge
+        self._pretty = pretty
         self._store = store
         self._logger = logger
         self._work_dir = work_dir
         self._deliverer = Deliverer(ctx, logger)
 
-    def set_judge(self, judge: Judge) -> None:
+    def set_judge(self, judge: Judge, pretty: Optional[PrettyPicker] = None) -> None:
         """热重载配置后换掉判据（阈值可能变了）。"""
         self._judge = judge
+        if pretty is not None:
+            self._pretty = pretty
 
     # ===== 检索 =====
 
@@ -193,14 +198,25 @@ class Pipeline:
         cfg: Any,
         override_stream: str = "",
         extra_keywords: Sequence[str] = (),
+        channel: str = "shi",
     ) -> Dict[str, Any]:
         """跑一轮：挑一条、下下来、发出去。返回本轮报告。
 
         override_stream 非空时只发到该会话（命令与自然语言触发用），
         否则发到配置里的所有群。extra_keywords 是点播的口味词。
+        channel 决定用哪套判据：shi = 评论区艾特率、pretty = 收藏率+短时长+只二次元。
         """
         report: Dict[str, Any] = {"sent": False, "reason": "", "candidate": None, "targets": []}
-        candidate = await self._pick(cfg, extra_keywords)
+        if channel == "pretty":
+            if self._pretty is None:
+                report["reason"] = "好看频道未初始化"
+                return report
+            candidate = await self._pretty.pick(cfg, extra_keywords)
+            if candidate is not None:
+                # 好看频道没有"花请求的检查"这一步，挑出来就标记，避免下载失败时每轮都挑同一条
+                self._store.mark_checked(candidate.bvid)
+        else:
+            candidate = await self._pick(cfg, extra_keywords)
         if candidate is None:
             report["reason"] = "本轮没有通过判据的候选"
             return report
