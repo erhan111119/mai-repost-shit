@@ -31,8 +31,12 @@ class StateStore:
         self._plan_date: str = ""
         self._plan_times: List[float] = []
         self._plan_done: List[float] = []
-        # 手动（自然语言）触发记录：聊天流 -> 触发时间戳列表，用于冷却与每日配额
+        # 手动（自然语言）触发记录：聊天流 -> 触发时间戳列表
         self._manual: Dict[str, List[float]] = {}
+        # 「群/人 -> 当前活动聊天流」：从入站消息学到的，发送时优先用它。
+        # 必须持久化：宿主 chat.get_stream_by_group_id 是 next(...) 取第一个匹配，
+        # 同一群存在多条历史会话时会返回过期的那个（实测路由落到 legacy 旧链、发送必失败）。
+        self._live: Dict[str, str] = {}
         self._dirty = False
 
     # ===== 读写 =====
@@ -59,6 +63,9 @@ class StateStore:
             for key, value in (raw.get("manual") or {}).items()
             if isinstance(value, list)
         }
+        self._live = {
+            str(key): str(value) for key, value in (raw.get("live_sessions") or {}).items() if value
+        }
 
     async def save(self) -> None:
         """异步落盘，避免阻塞事件循环。"""
@@ -69,6 +76,7 @@ class StateStore:
             "sent": self._sent[-_SENT_KEEP:],
             "plan": {"date": self._plan_date, "times": self._plan_times, "done": self._plan_done},
             "manual": self._manual,
+            "live_sessions": self._live,
         }
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         path = self._path
@@ -148,6 +156,20 @@ class StateStore:
             "times": [datetime.fromtimestamp(m).strftime("%H:%M") for m in self._plan_times],
             "remaining": [datetime.fromtimestamp(m).strftime("%H:%M") for m in remaining],
         }
+
+    # ===== 活动聊天流 =====
+
+    def remember_live_session(self, key: str, session_id: str) -> None:
+        """记下某个群/某个人当前实际在用的聊天流（来自入站消息）。"""
+        if not key or not session_id:
+            return
+        if self._live.get(key) == session_id:
+            return
+        self._live[key] = session_id
+        self._dirty = True
+
+    def live_session(self, key: str) -> str:
+        return self._live.get(key, "")
 
     # ===== 手动（自然语言）触发 =====
 

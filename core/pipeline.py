@@ -258,7 +258,8 @@ class Pipeline:
                 stream_id, kind = resolved
                 target_label = f"{label}（{kind}）"
             result = await self._deliverer.send(stream_id, candidate, video_path, cfg)
-            sent = bool(result.get("sent") or result.get("method") == "forward")
+            # 只看 sent：投递失败时 method 仍是 "forward"，用它判断会把失败误报成成功
+            sent = bool(result.get("sent"))
             report["targets"].append({"group": target_label, "sent": sent, "method": result.get("method")})
             if sent:
                 await append_context(self._ctx, stream_id, candidate, self._logger)
@@ -299,7 +300,24 @@ class Pipeline:
         先当群号找，找不到再当 QQ 号找私聊——配置里填一个 QQ 号是很自然的事
         （实测用户就把主人的 QQ 填进了 groups 以为是发给他），
         只支持群号会导致定时任务静默空转。
+
+        **优先用入站消息学到的活动聊天流**：宿主的 chat.get_stream_by_group_id 是
+        next(...) 取第一个匹配，同一群有多条历史会话时会返回过期的那条，
+        发送路由会落到 legacy 旧链并失败（实测：定时发送全挂、手动发送正常）。
         """
+        for prefix in ("group", "user"):
+            live = self._store.live_session(f"{prefix}:{target}")
+            if live:
+                kind = "群" if prefix == "group" else "私聊"
+                self._logger.info(f"目标 {target} 使用最近活动聊天流（{kind}）")
+                return live, kind
+
+        # 缓存里没有（比如刚重载完还没收到该群消息）：枚举同目标的所有会话，
+        # 用"最近有没有消息"挑出真正在用的那条
+        probed = await self._probe_by_recent_messages(target)
+        if probed:
+            return probed
+
         lookups = (
             ("群", self._ctx.chat.get_stream_by_group_id),
             ("私聊", self._ctx.chat.get_stream_by_user_id),
@@ -315,6 +333,53 @@ class Pipeline:
                 if session_id:
                     return session_id, kind
         return None
+
+    async def _probe_by_recent_messages(self, target: str) -> Optional[Tuple[str, str]]:
+        """在同目标的候选会话里，挑出最近有消息的那条。
+
+        宿主的 chat.get_stream_by_group_id 用 next(...) 取第一个匹配，同一群有多条历史会话时
+        会返回过期的那条（发送路由落到 legacy 旧链、必然失败）。这里用"有没有最近消息"来区分。
+        """
+        try:
+            payload = await self._ctx.chat.get_all_streams(platform="qq")
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(f"列举聊天流失败（回退到宿主查询）: {exc!r}")
+            return None
+        streams = payload.get("streams") if isinstance(payload, dict) else payload
+        if not isinstance(streams, list):
+            return None
+        candidates: List[Tuple[str, str]] = []
+        for item in streams:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("session_id") or "")
+            if not sid:
+                continue
+            if str(item.get("group_id") or "") == target:
+                candidates.append((sid, "群"))
+            elif not item.get("group_id") and str(item.get("user_id") or "") == target:
+                candidates.append((sid, "私聊"))
+        if len(candidates) <= 1:
+            return None  # 只有一条就交给宿主查询，不必多花请求
+        best: Optional[Tuple[str, str]] = None
+        best_stamp = ""
+        for sid, kind in candidates:
+            try:
+                recent = await self._ctx.message.get_recent(chat_id=sid, limit=1)
+            except Exception:  # noqa: BLE001
+                continue
+            items = recent.get("messages") if isinstance(recent, dict) else recent
+            if not isinstance(items, list) or not items:
+                continue
+            first = items[0] if isinstance(items[0], dict) else {}
+            stamp = str(first.get("timestamp") or first.get("time") or "")
+            if best is None or stamp > best_stamp:
+                best, best_stamp = (sid, kind), stamp
+        if best:
+            self._logger.info(f"目标 {target} 按最近消息定位到聊天流（{best[1]}）")
+            if self._store is not None:
+                self._store.remember_live_session(f"{'group' if best[1] == '群' else 'user'}:{target}", best[0])
+        return best
 
     def _cleanup_old_videos(self, keep: int) -> None:
         """只保留最近几个视频文件，其余删掉，避免插件数据目录无限膨胀。"""

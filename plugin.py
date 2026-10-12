@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.8", description="配置版本")
+    config_version: str = Field(default="1.2.0", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -497,6 +497,14 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
                 speaker,
                 str(user_info.get("user_cardname") or user_info.get("user_nickname") or ""),
             )
+            # 顺手记下"这个群/这个人当前在用的聊天流"，发送时优先用它（见 _resolve_stream）
+            if self._store is not None:
+                group_info = (message.get("message_info") or {}).get("group_info") or {}
+                group_id = str(group_info.get("group_id") or "").strip()
+                if group_id:
+                    self._store.remember_live_session(f"group:{group_id}", session_id)
+                else:
+                    self._store.remember_live_session(f"user:{speaker}", session_id)
         except Exception as exc:  # noqa: BLE001 - 缓存失败不影响入站
             self.ctx.logger.debug(f"缓存发言者失败（已忽略）: {exc!r}")
         return None

@@ -8,7 +8,7 @@
 # 插件总开关：装好后默认关闭，确认群号填对了再打开
 enabled = false
 # 配置版本（插件自己维护，一般不用动）
-config_version = "1.1.8"
+config_version = "1.2.0"
 
 [target]
 # 投递目标列表：填【群号】或【QQ 号】（填 QQ 号就是发给那个人私聊），不是 session_id；空串会被忽略。

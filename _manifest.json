@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.erhan111119.mai-repost-shit",
-  "version": "1.1.8",
+  "version": "1.2.0",
   "name": "B站搬史机（mai repost shit）",
   "description": "定时去B站捡评论区全是艾特的视频，下成 720p，以聊天记录形式搬进群",
   "author": {
@@ -33,7 +33,9 @@
     "chat.get_stream_by_group_id",
     "chat.get_stream_by_user_id",
     "maisaka.context.append",
-    "config.get"
+    "config.get",
+    "chat.get_all_streams",
+    "message.get_recent"
   ],
   "i18n": {
     "default_locale": "zh-CN",
