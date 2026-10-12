@@ -41,6 +41,18 @@ RECEIVE_HOOK = "chat.receive.after_process"
 # 回复后处理钩子：把 response 置空即可取消这次回复（宿主会记「返回了空回复」并不发送）
 REPLY_HOOK = "maisaka.reply.before_post_process"
 
+# 口语触发的命令正则。宿主用 re.compile(pattern).search(text) 匹配、**非锚定**，
+# 所以「憨憨，给我来点好看的」这种带称呼的说法也能命中。
+# 为什么做成命令而不是只靠 LLM 工具：实测群里说「来点好康的/涩的/好看的」时，
+# 模型只是聊天式回绝（「好看的没有了」），根本不调用工具；命令链是确定性的，
+# 而且 intercept 置 1 之后消息不进 LLM、机器人也不会回话。
+_ASK_WORDS = r"(?:来点|来几个|再来点|整点|搞点|发点|给点|找点|搬点|搬个|搬几个|搬几)"
+_SHI_WORDS = r"(?:史|屎|抽象|鬼畜|答辩|难绷|乐子)"
+_PRETTY_WORDS = r"(?:涩|(?<!颜)色|黄|好看|好康|二次元|纸片人|mmd)"
+_GAP = r"[^，。！？!?,、]{0,6}"
+SHI_TRIGGER_PATTERN = rf"(?i){_ASK_WORDS}{_GAP}{_SHI_WORDS}"
+PRETTY_TRIGGER_PATTERN = rf"(?i){_ASK_WORDS}{_GAP}{_PRETTY_WORDS}"
+
 
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
@@ -50,7 +62,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.1.1", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -600,7 +612,88 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             self.ctx.logger.info(f"本轮未搬：{report.get('reason')}")
         return report
 
-    # ===== 自然语言点播（LLM Tool）=====
+    # ===== 口语触发（命令链：确定性、不经过模型、不回话）=====
+
+    @Command(
+        "repost_by_words",
+        description="口语搬史：群里说「来点史/搬点屎/来点抽象的」就自动搬一条（不走模型、机器人不回话）",
+        pattern=SHI_TRIGGER_PATTERN,
+    )
+    async def cmd_repost_by_words(
+        self, text: str = "", stream_id: str = "", user_id: str = "", **kwargs: Any
+    ) -> Tuple[bool, str, int]:
+        """按口语触发搬史。返回 intercept=1，消息不再进 LLM。"""
+        del text, kwargs
+        return await self._trigger_by_words("shi", stream_id, user_id)
+
+    @Command(
+        "pretty_by_words",
+        description="口语点播好看的：群里说「来点涩的/来点黄的/来点好看的/来点好康的」就自动搬一条（不走模型、不回话）",
+        pattern=PRETTY_TRIGGER_PATTERN,
+    )
+    async def cmd_pretty_by_words(
+        self, text: str = "", stream_id: str = "", user_id: str = "", **kwargs: Any
+    ) -> Tuple[bool, str, int]:
+        """按口语触发好看频道。返回 intercept=1，消息不再进 LLM。"""
+        del text, kwargs
+        return await self._trigger_by_words("pretty", stream_id, user_id)
+
+    def _permission_denied_for_user(self, user_id: str) -> str:
+        """用真实 QQ 号判权限（命令链能拿到真实发言者，比工具那条缓存路径更准）。"""
+        mode = self._permission_mode()
+        if mode == "anyone":
+            return ""
+        allowed = {q for q in (normalize_qq(x) for x in self.config.tool.whitelist) if q}
+        if not allowed:
+            return "白名单还没配"
+        speaker = normalize_qq(user_id)
+        if not speaker:
+            return "没认出你是谁"
+        if speaker not in allowed:
+            return f"只对白名单开放（{speaker} 不在名单里）"
+        return ""
+
+    async def _trigger_by_words(self, channel: str, stream_id: str, user_id: str) -> Tuple[bool, str, int]:
+        """口语触发的公共实现（两个频道共用）。"""
+        # 命令链的返回值不会发到群里（宿主只写日志），所以这里的文字只是给日志看的
+        if not self.config.plugin.enabled:
+            return False, "插件未启用", 0
+        if not stream_id:
+            return False, "拿不到当前会话", 0
+        if channel == "pretty" and not self.config.pretty.enabled:
+            return False, "好看频道未启用", 0
+        denied = self._permission_denied_for_user(user_id)
+        if denied:
+            return False, f"权限不足：{denied}", 1
+        if self._store is None:
+            return False, "插件未就绪", 0
+        if self._manual_busy or self._running:
+            return False, "正在搬上一条", 1
+
+        key = f"{stream_id}#pretty" if channel == "pretty" else stream_id
+        cooldown = (
+            self.config.pretty.cooldown_minutes if channel == "pretty" else self.config.tool.cooldown_minutes
+        )
+        daily = (
+            self.config.pretty.daily_limit_per_group
+            if channel == "pretty"
+            else self.config.tool.daily_limit_per_group
+        )
+        block = self._store.manual_block_reason(key, cooldown_minutes=cooldown, daily_limit=daily)
+        if block:
+            return False, f"被限流：{block}", 1
+
+        self._store.record_manual(key)
+        await self._store.save()
+        self._manual_busy = True
+        task = asyncio.create_task(
+            self._manual_share(stream_id, 1, [], channel=channel), name=f"mai-repost-{channel}-words"
+        )
+        task.add_done_callback(self._on_manual_done)
+        # intercept=1：消息不进 LLM，机器人不会为这条消息说话
+        return True, f"已触发{channel}频道搬运", 1
+
+    # ===== 自然语言点播（LLM Tool，模型主动调用时走这条）=====
 
     @Tool(
         TOOL_REPOST,
