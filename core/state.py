@@ -160,23 +160,21 @@ class StateStore:
             else:
                 self._manual.pop(key, None)
 
-    def manual_block_reason(self, key: str, cooldown_minutes: int, daily_limit: int) -> str:
-        """返回不允许手动触发的原因；允许则返回空串。"""
+    def manual_block_reason(self, key: str, min_gap_seconds: int) -> str:
+        """返回不允许手动触发的原因；允许则返回空串。
+
+        只挡「刚搬完又来一条」这种贴脸请求，不设冷却时长、也不设每日次数上限。
+        min_gap_seconds <= 0 表示完全不挡。
+        """
+        if min_gap_seconds <= 0:
+            return ""
         now_ts = time.time()
         self._prune_manual(now_ts)
         history = self._manual.get(key) or []
-        if cooldown_minutes > 0 and history:
+        if history:
             elapsed = now_ts - max(history)
-            if elapsed < cooldown_minutes * 60:
-                wait = int((cooldown_minutes * 60 - elapsed) / 60) + 1
-                return f"刚搬过，再过 {wait} 分钟"
-        if daily_limit > 0:
-            today = datetime.now().strftime("%Y-%m-%d")
-            used = sum(
-                1 for ts in history if datetime.fromtimestamp(ts).strftime("%Y-%m-%d") == today
-            )
-            if used >= daily_limit:
-                return f"今天这个群已经手动搬了 {used} 次（上限 {daily_limit} 次）"
+            if elapsed < min_gap_seconds:
+                return f"刚搬过（{int(elapsed)} 秒前），间隔太短，过 {int(min_gap_seconds - elapsed)} 秒再来"
         return ""
 
     def record_manual(self, key: str) -> None:

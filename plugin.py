@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.6", description="配置版本")
+    config_version: str = Field(default="1.1.7", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -171,8 +171,10 @@ class ToolSectionConfig(PluginConfigBase):
     )
     whitelist: List[str] = Field(default_factory=list, description="permission=whitelist 时允许触发的 QQ 号列表")
     speaker_cache_ttl_seconds: int = Field(default=600, description="发言者缓存有效期（秒），超时后白名单模式会拒绝")
-    cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
-    daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
+    min_gap_seconds: int = Field(
+        default=60,
+        description="同一个群两次点播的最小间隔（秒）：只挡贴脸连点，不设每日次数上限；0 表示完全不挡",
+    )
     max_count: int = Field(default=3, description="单次点播最多搬几条")
     suppress_reply: bool = Field(
         default=True,
@@ -224,8 +226,10 @@ class PrettySectionConfig(PluginConfigBase):
         default_factory=lambda: list(DEFAULT_PRETTY_BLOCK_WORDS),
         description="教程/讲解类屏蔽词：标题或标签命中即跳过（只想要好看的画面，不想要教学）",
     )
-    cooldown_minutes: int = Field(default=10, description="同一个群两次点播的最小间隔（分钟）")
-    daily_limit_per_group: int = Field(default=3, description="每个群每天点播的次数上限（0 表示不限）")
+    min_gap_seconds: int = Field(
+        default=60,
+        description="同一个群两次点播的最小间隔（秒）：只挡贴脸连点，不设每日次数上限；0 表示完全不挡",
+    )
 
 
 class ShitpostConfig(PluginConfigBase):
@@ -687,17 +691,12 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             return False, "正在搬上一条", 1
 
         key = f"{stream_id}#pretty" if channel == "pretty" else stream_id
-        cooldown = (
-            self.config.pretty.cooldown_minutes if channel == "pretty" else self.config.tool.cooldown_minutes
+        gap = (
+            self.config.pretty.min_gap_seconds if channel == "pretty" else self.config.tool.min_gap_seconds
         )
-        daily = (
-            self.config.pretty.daily_limit_per_group
-            if channel == "pretty"
-            else self.config.tool.daily_limit_per_group
-        )
-        block = self._store.manual_block_reason(key, cooldown_minutes=cooldown, daily_limit=daily)
+        block = self._store.manual_block_reason(key, min_gap_seconds=gap)
         if block:
-            return False, f"被限流：{block}", 1
+            return False, f"被拒绝：{block}", 1
 
         self._store.record_manual(key)
         await self._store.save()
@@ -759,12 +758,8 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
 
         limit = max(1, self.config.tool.max_count)
         wanted = max(1, min(int(count or 1), limit))
-        # 手动触发不占定时配额，但有独立的冷却与每日上限（按会话记账）
-        block = self._store.manual_block_reason(
-            stream_id,
-            cooldown_minutes=self.config.tool.cooldown_minutes,
-            daily_limit=self.config.tool.daily_limit_per_group,
-        )
+        # 不限次数、不设冷却，只在"刚搬完又来一条"时拒绝（避免贴脸连点）
+        block = self._store.manual_block_reason(stream_id, min_gap_seconds=self.config.tool.min_gap_seconds)
         if block:
             return self._tool_result(f"先不搬：{block}。")
 
@@ -831,11 +826,9 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
 
         limit = max(1, self.config.tool.max_count)
         wanted = max(1, min(int(count or 1), limit))
-        # 冷却与配额按频道分开记，免得点播好看的把搬史的额度吃掉
+        # 不限次数、不设冷却；两个频道的最小间隔分开记
         block = self._store.manual_block_reason(
-            f"{stream_id}#pretty",
-            cooldown_minutes=self.config.pretty.cooldown_minutes,
-            daily_limit=self.config.pretty.daily_limit_per_group,
+            f"{stream_id}#pretty", min_gap_seconds=self.config.pretty.min_gap_seconds
         )
         if block:
             return self._tool_result(f"先不搬：{block}。", tunnel)
@@ -1006,8 +999,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             "投递方式 聊天记录（合并转发）；失败只记本地日志，不在群里说话",
             f"自然语言点播：{'开' if self.config.tool.enabled else '关'}"
             f"（{self._describe_permission(self._permission_mode())}，"
-            f"冷却 {self.config.tool.cooldown_minutes} 分钟，每群每天 "
-            f"{self.config.tool.daily_limit_per_group} 次）",
+            f"不限次数，最小间隔 {self.config.tool.min_gap_seconds} 秒）",
         ]
         if recent:
             lines.append("最近搬过：")
