@@ -31,36 +31,15 @@ from .state import StateStore
 _SERIES_RE = re.compile(r"第\s*\d{1,4}\s*[集话期季]|EP\s*\d{1,4}|第[一二三四五六七八九十]{1,3}[集话期]")
 
 # LLM 复核提示词：让模型判断「画面向好看内容」还是「低创剧集/剧情向」
-_REVIEW_TEMPLATE = """下面是B站上一条短视频的元信息。请判断它是不是「好看的二次元画面向内容」。
-
-要的是这三类（画面或动态本身就是看点）：
-1. MMD/3D 纸片人舞蹈；
-2. 动漫画面剪辑（MAD/AMV、踩点混剪）；
-3. 手书/同人动画（画师自己画的短片）。
-
-不要的是：低创自制动画剧集（例如"某某新番 第4集"这种连载）、剧情向/配音向短片、
-杂谈解说、教程讲解、静态图文/壁纸合集、真人出镜内容。
-注意：虚拟主播本体不算问题（Hololive 之类的 MMD 可以），但直播切片/会限/杂谈不要。
-
-标题：{title}
-UP：{author}
-分区：{typename}
-标签：{tags}
-时长：{duration}秒　播放：{play}　点赞率：{like_play}　收藏/点赞：{fav_like}
-
-只回一行：符合就回「好看」，不符合就回「不要」，后面跟不超过 20 字的理由。"""
 
 
 class PrettyPicker:
     """「来点好看的」候选挑选器（不需要评论请求，纯靠搜索接口自带的数据判断）。"""
 
-    def __init__(self, client: BiliClient, store: StateStore, logger: Any, ctx: Any = None) -> None:
+    def __init__(self, client: BiliClient, store: StateStore, logger: Any) -> None:
         self._client = client
         self._store = store
         self._logger = logger
-        # ctx 用于 LLM 复核（ctx.llm.generate）；没有 ctx 时自动跳过复核
-        self._ctx = ctx
-        self._llm_available = ctx is not None
 
 
     @staticmethod
@@ -111,42 +90,6 @@ class PrettyPicker:
         if cfg.pretty_rate_metric == "fav_like":
             return favorite / like if like else None
         return favorite / play if play else None
-
-    async def _llm_verdict(self, item: Dict[str, Any], cfg: Any) -> Optional[bool]:
-        """让模型判断「是不是好看的画面向内容」。返回 True/False；无法判断时返回 None。"""
-        if not getattr(cfg, "pretty_llm_review", False) or not self._llm_available:
-            return None
-        try:
-            play = int(item.get("play") or 0)
-            like = int(item.get("like") or 0)
-            fav = int(item.get("favorites") or 0)
-            prompt = _REVIEW_TEMPLATE.format(
-                title=str(item.get("title") or ""),
-                author=str(item.get("author") or ""),
-                typename=str(item.get("typename") or ""),
-                tags=str(item.get("tag") or "")[:80],
-                duration=parse_duration(str(item.get("duration") or "")),
-                play=play,
-                like_play=f"{like / play:.1%}" if play else "-",
-                fav_like=f"{fav / like:.2f}" if like else "-",
-            )
-            result = await self._ctx.llm.generate(
-                prompt=prompt,
-                model=str(getattr(cfg, "pretty_llm_model", "") or ""),
-                temperature=0.2,
-                max_tokens=120,
-            )
-        except Exception as exc:  # noqa: BLE001 - 复核失败不能拖垮搬运
-            self._logger.warning(f"[好看] LLM 复核异常，跳过复核: {exc!r}")
-            self._llm_available = False
-            return None
-        if not (isinstance(result, dict) and result.get("success")):
-            self._logger.warning(f"[好看] LLM 复核失败（{result.get('error') if isinstance(result, dict) else result}），跳过复核")
-            self._llm_available = False
-            return None
-        verdict = str(result.get("response") or "").strip()
-        self._logger.info(f"[好看] LLM 复核：{verdict[:60]}")
-        return "不要" not in verdict
 
     async def pick(self, cfg: Any, extra_keywords: Sequence[str] = ()) -> Optional[Candidate]:
         """从搜索结果里挑一条最好的（收藏率最高的那条，同分随机）。"""
@@ -201,15 +144,8 @@ class PrettyPicker:
         ready.sort(key=lambda row: (row[0], row[1]), reverse=True)
         # 搜索结果里没有 cid，下载播放地址必须要它，所以选中的候选要再拉一次详情补齐。
         # 顺手用详情里的数据覆盖一遍（搜索接口的统计有时是缓存的），并按真实时长再校验一次。
-        attempts = max(3, int(getattr(cfg, "pretty_llm_review_attempts", 3) or 3))
-        for _ratio, _, item, _ in ready[:attempts]:
+        for _ratio, _, item, _ in ready[:3]:
             bvid = str(item.get("bvid") or "")
-            verdict = await self._llm_verdict(item, cfg)
-            if verdict is False:
-                # 判为不要：标记已检查，避免每轮都重新问一次
-                self._store.mark_checked(bvid)
-                self._logger.info(f"[好看] LLM 判为不要，换下一条：{str(item.get('title') or '')[:26]}")
-                continue
             try:
                 detail = await self._client.video_detail(bvid)
             except BiliError as exc:

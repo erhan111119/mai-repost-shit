@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.1.5", description="配置版本")
+    config_version: str = Field(default="1.1.6", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -220,13 +220,6 @@ class PrettySectionConfig(PluginConfigBase):
         default_factory=lambda: list(DEFAULT_PRETTY_REAL_BLOCK),
         description="真人向屏蔽词：标题或标签命中即跳过",
     )
-    llm_review: bool = Field(
-        default=True,
-        description="是否让模型复核候选：把标题/UP/分区/数据交给模型判断「是不是好看画面向内容」，"
-        "答「不要」就换下一条。指标抓不住低创自制剧集，只能靠语义判",
-    )
-    llm_review_attempts: int = Field(default=3, description="最多复核几条候选（每条一次 LLM 调用）")
-    llm_model: str = Field(default="", description="复核用的模型；留空走宿主默认任务")
     block_words: List[str] = Field(
         default_factory=lambda: list(DEFAULT_PRETTY_BLOCK_WORDS),
         description="教程/讲解类屏蔽词：标题或标签命中即跳过（只想要好看的画面，不想要教学）",
@@ -288,9 +281,6 @@ class RunConfig:
     pretty_typename_whitelist: List[str]
     pretty_real_blacklist: List[str]
     pretty_block_words: List[str]
-    pretty_llm_review: bool
-    pretty_llm_review_attempts: int
-    pretty_llm_model: str
 
 
 class BilibiliShitpostPlugin(MaiBotPlugin):
@@ -333,7 +323,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             store=self._store,
             logger=self.ctx.logger,
             work_dir=work_dir,
-            pretty=PrettyPicker(self._client, self._store, self.ctx.logger, self.ctx),
+            pretty=PrettyPicker(self._client, self._store, self.ctx.logger),
         )
         self._loop_task = asyncio.create_task(self._schedule_loop(), name="mai-repost-shit-scheduler")
         mode = self._permission_mode()
@@ -409,7 +399,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         if self._client is not None and self._pipeline is not None:
             self._pipeline.set_judge(
                 Judge(self._client, self._run_config(), self.ctx.logger),
-                PrettyPicker(self._client, self._store, self.ctx.logger, self.ctx) if self._store else None,
+                PrettyPicker(self._client, self._store, self.ctx.logger) if self._store else None,
             )
 
     # ===== 配置快照 =====
@@ -456,9 +446,6 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             pretty_typename_whitelist=list(cfg.pretty.typename_whitelist),
             pretty_real_blacklist=list(cfg.pretty.real_blacklist),
             pretty_block_words=list(cfg.pretty.block_words),
-            pretty_llm_review=cfg.pretty.llm_review,
-            pretty_llm_review_attempts=cfg.pretty.llm_review_attempts,
-            pretty_llm_model=str(cfg.pretty.llm_model or ""),
         )
 
     # ===== 发言者缓存与点播权限 =====
