@@ -286,7 +286,23 @@ prompt 当判据**。实测规则层挡下两条垃圾样本，LLM 层在第一�
 最后本轮空手。所以提示词里必须把"虚拟主播本体不算问题"这种边界写清楚，
 否则模型会凭直觉扩大打击面。
 
-## 十七、"手动能发、定时发不出去"：过期聊天流（1.2.0）
+## 十七、转发里 video 必须独占节点（1.2.1）
+
+真机报错（经 SnowLuma 适配器发私聊）：
+
+```
+[SendService] Platform IO 发送失败: driver=gateway:...snowluma-adapter:snowluma_gateway
+  status=FAILED error=对端动作返回失败: action=send_private_forward_msg
+  message=message element "video" must be the only segment in a message
+```
+
+「文字 + 视频」放同一个转发节点会被**对端 QQ** 拒掉（适配器本身编码正常，
+错误来自对端动作返回值）。改成两条节点——第一条只有说明文字、第二条只有视频后，
+NapCat 与 SnowLuma 的编码结果都是 `{"type": "video", "data": {"file": "file://..."}}`
+且 video 独占节点。**注意 NapCat 侧对同节点是容忍的**（早期就是那么发成功的），
+但兼容两边就得拆开。
+
+## 十八、"手动能发、定时发不出去"：过期聊天流（1.2.0）
 
 真机现象：定时轮的日志写着「本轮已搬」，群里却什么都没有。
 
@@ -320,7 +336,7 @@ stream = next((item for item in self._list_sessions(...) if str(item.group_id) =
 **教训**：只要发送链路上有"失败也返回某个字段"的情况，用那个字段做 `or` 判断就会伪造成功；
 判定成功只认一个权威字段。
 
-## 十八、没找到就继续找（1.1.8）
+## 十九、没找到就继续找（1.1.8）
 
 原本一轮没挑到候选就直接返回"本轮没有通过判据的候选"，用户要求"没找到继续找"。
 实现：`Pipeline.run_once` 里把挑候选包成循环，最多 `[retry].rounds` 轮（默认 3），
@@ -330,7 +346,7 @@ stream = next((item for item in self._list_sessions(...) if str(item.group_id) =
 **代价要清楚**：搬史一轮最多 8 次搜索 + 16 次"1 详情 + 3 页评论"（约 70 个请求），
 三轮就是 ~200 个请求；好看一轮约 6 次搜索、很便宜。所以要吵就把 rounds 调小。
 
-## 十九、点播不限次数，只留最小间隔（1.1.7）
+## 二十、点播不限次数，只留最小间隔（1.1.7）
 
 用户要求：去掉指令与工具路径的冷却和每日次数，但"间隔过少可以拒绝"。所以：
 删掉 `cooldown_minutes`（10 分钟）与 `daily_limit_per_group`（每群每天 3 次），
@@ -340,7 +356,7 @@ stream = next((item for item in self._list_sessions(...) if str(item.group_id) =
 同时保留原有的两个守卫：并发忙锁（`_manual_busy` / `_running`，防止同时跑两轮）与
 `[tool].permission` 权限（anyone/whitelist）。工具是否被调用仍由模型自己决定。
 
-## 二十、LLM 复核被去掉了（1.1.6）
+## 二十一、LLM 复核被去掉了（1.1.6）
 
 1.1.4 加过一层 LLM 语义复核，1.1.6 按用户要求完全删掉，原因有两条：
 
@@ -354,7 +370,7 @@ stream = next((item for item in self._list_sessions(...) if str(item.group_id) =
 给桩写测试时我拿「prompt 里是否含『教程』」当判据，结果模板正文本身就有"教程讲解"，
 导致好样本全被判不要。测试必须只看结构化字段。
 
-## 二十一、「来点好看的」频道的数据依据（1.1.0）
+## 二十二、「来点好看的」频道的数据依据（1.1.0）
 
 需求：时长不长、收藏率高、**只要二次元不要真人**。
 
@@ -389,7 +405,7 @@ stream = next((item for item in self._list_sessions(...) if str(item.group_id) =
 现在选中后会拉一次 `video_detail` 补齐 cid/aid，并用详情里的真实数据复核时长与收藏率，
 拿不到就顺延下一条。
 
-## 二十二、自然语言点播的身份校验怎么做
+## 二十三、自然语言点播的身份校验怎么做
 
 Tool 回调里**拿不到点播者的真实 QQ 号**（群聊场景下工具回调的 `user_id` 恒为空，
 这是宿主的既有行为）。但身份不是没法判——**入站钩子带真实发言者**，所以做法是：

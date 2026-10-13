@@ -31,12 +31,33 @@ def build_forward_messages(
     bot_name: str,
     include_header: bool = True,
 ) -> List[Dict[str, Any]]:
-    """构造合并转发节点：一段说明文字 + 视频本体。"""
-    segments: List[Dict[str, Any]] = []
+    """构造合并转发节点列表。
+
+    **文字与视频必须分成两个节点**：实测经 SnowLuma 适配器发送时，对端会拒绝
+    「文字 + 视频」同一个节点的转发：
+
+        对端动作返回失败: action=send_private_forward_msg
+        message=message element "video" must be the only segment in a message
+
+    也就是说转发里的 video 段必须独占一个节点。分成两个节点后 NapCat 与 SnowLuma 都能发。
+    """
+    nodes: List[Dict[str, Any]] = []
     if include_header:
-        segments.append({"type": "text", "content": candidate.header_text()})
-    segments.append({"type": "video", "file": video_path.as_posix()})
-    return [{"user_id": bot_qq, "nickname": bot_name, "segments": segments}]
+        nodes.append(
+            {
+                "user_id": bot_qq,
+                "nickname": bot_name,
+                "segments": [{"type": "text", "content": candidate.header_text()}],
+            }
+        )
+    nodes.append(
+        {
+            "user_id": bot_qq,
+            "nickname": bot_name,
+            "segments": [{"type": "video", "file": video_path.as_posix()}],
+        }
+    )
+    return nodes
 
 
 class Deliverer:
