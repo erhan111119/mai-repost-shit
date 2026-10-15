@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.erhan111119.mai-repost-shit",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "name": "B站搬史机（mai repost shit）",
   "description": "定时去B站捡评论区全是艾特的视频，下成 720p，以聊天记录形式搬进群",
   "author": {

@@ -63,7 +63,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件（同时控制定时搬运）")
-    config_version: str = Field(default="1.2.1", description="配置版本")
+    config_version: str = Field(default="1.2.2", description="配置版本")
 
 
 class TargetSectionConfig(PluginConfigBase):
@@ -128,12 +128,18 @@ class DownloadSectionConfig(PluginConfigBase):
 
     max_duration_seconds: int = Field(default=240, description="视频时长上限（秒）")
     max_size_mb: int = Field(
-        default=15,
+        default=10,
         description="体积上限（MB）。超限会自动降一档清晰度；实测 37MB 的视频三条投递路线都会被"
         "平台判失败，所以别放太大",
     )
     quality_preference: List[int] = Field(
         default_factory=lambda: [64, 32, 16], description="清晰度优先级（64=720P, 32=480P, 16=360P）"
+    )
+    inline_video_max_mb: int = Field(
+        default=10,
+        description="视频内联发送的体积上限（MB）：不超过就带 base64 发，后端读不到本地文件也能发"
+        "（实测 SnowLuma 后端跑在别的文件系统、给路径会 EACCES）。"
+        "上限受插件↔宿主 RPC 帧 16MB 约束，base64 膨胀 4/3，所以别超过 11",
     )
     keep_files: int = Field(default=2, description="本地保留最近几个视频文件")
 
@@ -282,6 +288,7 @@ class RunConfig:
     max_duration_seconds: int
     max_size_mb: int
     quality_preference: List[int]
+    inline_video_max_mb: int
     keep_files: int
     title_blacklist: List[str]
     tag_blacklist: List[str]
@@ -450,6 +457,7 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
             max_duration_seconds=cfg.download.max_duration_seconds,
             max_size_mb=cfg.download.max_size_mb,
             quality_preference=list(cfg.download.quality_preference),
+            inline_video_max_mb=cfg.download.inline_video_max_mb,
             keep_files=cfg.download.keep_files,
             title_blacklist=list(cfg.filters.title_blacklist),
             tag_blacklist=list(cfg.filters.tag_blacklist),

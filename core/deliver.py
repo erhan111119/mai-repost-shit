@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,6 +32,7 @@ def build_forward_messages(
     bot_qq: str,
     bot_name: str,
     include_header: bool = True,
+    video_base64: str = "",
 ) -> List[Dict[str, Any]]:
     """构造合并转发节点列表。
 
@@ -50,13 +53,14 @@ def build_forward_messages(
                 "segments": [{"type": "text", "content": candidate.header_text()}],
             }
         )
-    nodes.append(
-        {
-            "user_id": bot_qq,
-            "nickname": bot_name,
-            "segments": [{"type": "video", "file": video_path.as_posix()}],
-        }
-    )
+    # 视频优先内联 base64：后端（如 SnowLuma）可能跑在别的文件系统/容器里，
+    # 给它一个本机路径它读不到（实测报 EACCES，realpath /root/maibot/...）；
+    # base64 把数据放进消息本身，与后端在哪台机器无关。
+    if video_base64:
+        video_segment: Dict[str, Any] = {"type": "video", "binary_data_base64": video_base64}
+    else:
+        video_segment = {"type": "video", "file": video_path.as_posix()}
+    nodes.append({"user_id": bot_qq, "nickname": bot_name, "segments": [video_segment]})
     return nodes
 
 
@@ -72,11 +76,25 @@ class Deliverer:
         bot_qq = str(await self._ctx.config.get("bot.qq_account", "") or "")
         bot_name = str(await self._ctx.config.get("bot.nickname", "") or "麦麦")
         try:
-            size_mb = video_path.stat().st_size / 1024 / 1024
+            size_bytes = video_path.stat().st_size
         except OSError:
-            size_mb = 0.0
+            size_bytes = 0
+        size_mb = size_bytes / 1024 / 1024
+        # 体积在内联预算内就带 base64 发（后端无需读本地文件），超预算才退回路径引用
+        inline_limit = int(getattr(cfg, "inline_video_max_mb", 0) or 0) * 1024 * 1024
+        video_base64 = ""
+        if inline_limit and 0 < size_bytes <= inline_limit:
+            try:
+                video_base64 = base64.b64encode(await asyncio.to_thread(video_path.read_bytes)).decode("ascii")
+            except OSError as exc:
+                self._logger.warning(f"读取视频用于内联失败，退回路径引用: {exc!r}")
+        if not video_base64:
+            self._logger.warning(
+                f"视频 {size_mb:.1f}MB 超过内联预算（{getattr(cfg, 'inline_video_max_mb', 0)}MB），"
+                "改用本地路径引用——若后端不在同一台机器/容器里会读不到而发送失败"
+            )
         messages = build_forward_messages(
-            candidate, video_path, bot_qq, bot_name, cfg.include_header_text
+            candidate, video_path, bot_qq, bot_name, cfg.include_header_text, video_base64
         )
         try:
             result = await self._ctx.send.forward(messages, stream_id, return_details=True)

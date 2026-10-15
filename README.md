@@ -205,6 +205,9 @@ max_count = 3            # 单次最多搬几条
 ## 投递方式与它的风险
 
 投递成一条**聊天记录**（合并转发），里面是**两个节点**：第一个是说明文字，第二个只有视频。
+视频默认**内联成 base64** 塞进消息（`inline_video_max_mb`，默认 10MB）——因为后端
+（实测 SnowLuma）可能跑在另一个文件系统/容器里，给它本机路径会 `EACCES` 读不到；
+超过上限才退回路径引用并打 warning。
 分成两个节点是必须的——经 SnowLuma 适配器发送时，对端 QQ 会拒绝"文字 + 视频"同节点，
 报 `message element "video" must be the only segment in a message`。需要知道的是：
 
