@@ -34,6 +34,8 @@
     "chat.get_stream_by_user_id",
     "maisaka.context.append",
     "config.get",
+    "component.enable",
+    "component.disable",
     "chat.get_all_streams",
     "message.get_recent"
   ],
