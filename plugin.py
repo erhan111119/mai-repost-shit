@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .core.bili_api import BiliClient
@@ -323,11 +323,13 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         self._speakers: Optional[SpeakerCache] = None
         # 会话 -> 吞回话的截止时间：点播后这段时间内的第一条回复会被取消
         self._reply_suppress: Dict[str, float] = {}
+        self._tool_enabled: Dict[str, bool] = {}
 
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
         """装载状态、建客户端、起定时循环。"""
+        await self._sync_tool_enabled()
         data_dir = self.ctx.paths.data_dir
         work_dir = self.ctx.paths.runtime_dir / "clips"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -414,8 +416,28 @@ class BilibiliShitpostPlugin(MaiBotPlugin):
         if self._client is not None:
             await self._client.aclose()
 
+    async def _sync_tool_enabled(self) -> None:
+        """仅在配置启用条件变化时同步，避免无关更新覆盖管理员的组件禁用。"""
+        states = {
+            TOOL_REPOST: self.config.plugin.enabled and self.config.tool.enabled,
+            TOOL_PRETTY: self.config.plugin.enabled and self.config.pretty.enabled,
+        }
+        for name, enabled in states.items():
+            if self._tool_enabled.get(name) == enabled:
+                continue
+            full_name = f"{self.ctx.plugin_id}.{name}"
+            if enabled:
+                result = await self.ctx.component.enable_component(full_name, "tool", scope="global")
+            else:
+                result = await self.ctx.component.disable_component(full_name, "tool", scope="global")
+            if not result["success"]:
+                raise RuntimeError(f"同步工具启停失败（{full_name}, enabled={enabled}）：{result}")
+            self._tool_enabled[name] = enabled
+
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热重载：判据的阈值要跟着换。"""
+        """配置热重载：同步工具启停，判据的阈值跟着换。"""
+        if scope == CONFIG_RELOAD_SCOPE_SELF:
+            await self._sync_tool_enabled()
         self.ctx.logger.info(f"配置已更新（scope={scope} version={version}），下一轮生效")
         if self._client is not None and self._pipeline is not None:
             self._pipeline.set_judge(
